@@ -1,0 +1,40 @@
+{
+  "tables": [
+    {
+      "id": "worm_holer",
+      "name": "WORM HOLER",
+      "subtitle": "Survive the Singularity",
+      "theme": "space",
+      "ballColor": "#c0e0ff",
+      "accentColor": "#4400ff",
+      "secondColor": "#ff00cc",
+      "bgColor": "#000008",
+      "unlocked": true,
+      "highScores": []
+    },
+    {
+      "id": "barfs_house",
+      "name": "BARF'S HOUSE",
+      "subtitle": "Based on the Hit TV Show!",
+      "theme": "sitcom",
+      "ballColor": "#ffdd00",
+      "accentColor": "#ff6600",
+      "secondColor": "#00cc44",
+      "bgColor": "#1a0800",
+      "unlocked": true,
+      "highScores": []
+    },
+    {
+      "id": "shower_defense",
+      "name": "SHOWER DEFENSE",
+      "subtitle": "Defend Your Drain!",
+      "theme": "bathroom",
+      "ballColor": "#aaddff",
+      "accentColor": "#0088ff",
+      "secondColor": "#00ffcc",
+      "bgColor": "#001820",
+      "unlocked": true,
+      "highScores": []
+    }
+  ]
+}
