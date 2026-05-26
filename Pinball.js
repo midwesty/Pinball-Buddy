@@ -111,6 +111,10 @@ function applyTableToPB(){
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
 function buildUI(){
+  // Define globals FIRST so onclick attrs work immediately
+  window.pbK=(k,v)=>{_keys[k]=!!v;};
+  window.pbClose=pbClose;
+
   _ov.innerHTML=`
   <div class="pb-shell">
     <div class="pb-dmd-bar">
@@ -122,22 +126,21 @@ function buildUI(){
     <div class="pb-btns">
       <button class="pb-btn pb-l"
         onmousedown="pbK('left',1)" onmouseup="pbK('left',0)"
-        ontouchstart="pbK('left',1);event.preventDefault()" ontouchend="pbK('left',0)">◀ LEFT</button>
+        ontouchstart="pbK('left',1)" ontouchend="pbK('left',0)" ontouchcancel="pbK('left',0)">◀ LEFT</button>
       <button class="pb-btn pb-m"
         onmousedown="pbK('space',1)" onmouseup="pbK('space',0)"
-        ontouchstart="pbK('space',1);event.preventDefault()" ontouchend="pbK('space',0)">LAUNCH</button>
+        ontouchstart="pbK('space',1)" ontouchend="pbK('space',0)" ontouchcancel="pbK('space',0)">LAUNCH</button>
       <button class="pb-btn pb-r"
         onmousedown="pbK('right',1)" onmouseup="pbK('right',0)"
-        ontouchstart="pbK('right',1);event.preventDefault()" ontouchend="pbK('right',0)">RIGHT ▶</button>
+        ontouchstart="pbK('right',1)" ontouchend="pbK('right',0)" ontouchcancel="pbK('right',0)">RIGHT ▶</button>
     </div>
   </div>
   <button class="pb-x" onclick="pbClose()">✕</button>`;
+
   _canvas=document.getElementById('pbCanvas');
   _ctx=_canvas.getContext('2d');
   _dmd=document.getElementById('pbDMD');
   _dctx=_dmd.getContext('2d');
-  window.pbK=(k,v)=>{_keys[k]=!!v;};
-  window.pbClose=pbClose;
 }
 
 function bindKeys(){
@@ -1837,7 +1840,7 @@ function injectStyles(){
 .pb-dmd-bar{width:${PB.W}px;flex-shrink:0;background:#040302;border:2px solid #2a2a2a;border-bottom:none;border-radius:6px 6px 0 0;overflow:hidden;}
 #pbDMD{display:block;}
 .pb-field{flex-shrink:1;overflow:hidden;line-height:0;}
-#pbCanvas{display:block;max-height:calc(100dvh - 96px - 52px);width:auto;}
+#pbCanvas{display:block;max-height:calc(100dvh - 96px - 52px);width:auto;touch-action:none;}
 .pb-btns{width:${PB.W}px;display:flex;gap:3px;background:#080808;border:2px solid #222;border-top:1px solid #2a2a2a;padding:5px 6px;box-sizing:border-box;flex-shrink:0;}
 .pb-btn{font-family:monospace;font-weight:bold;font-size:13px;padding:9px 0;border:2px solid #333;border-radius:5px;background:#101010;color:#fff;cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation;user-select:none;}
 .pb-btn:active,.pb-btn:focus{background:#282828;border-color:#888;outline:none;}
