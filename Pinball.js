@@ -199,6 +199,17 @@ function update(dt){
 
 function anyKey(){return _keys.left||_keys.right||_keys.space;}
 
+function updateFlippers(dt){
+  _pb.flippers.forEach(f => {
+    const want = (f.side==='left' && _keys.left) ||
+                 (f.side==='right' && _keys.right);
+    if(want !== f.active){
+      f.active = want;
+      if(want) snd('flipper');
+    }
+  });
+}
+
 function updatePlunge(dt){
   updateFlippers(dt);
   if(_keys.space){
