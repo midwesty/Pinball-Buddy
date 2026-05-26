@@ -22,10 +22,21 @@ const PB = {
 
 // Playfield walls
 const wallL=44, wallR=436, wallT=18;
-// Flipper geometry — REST = tip pointing DOWN (positive angle), ACTIVE = tip UP (negative)
-// Pivot L=154, R=326, len=82: rest gap=28px (>ball diameter 22px, gutters on each side)
-const FL = { leftX:154, rightX:326, y:752, len:82, w:11, restAngle:0.50, activeAngle:0.52 };
-// Side gutter inlane guide x positions (moved inward to create proper gutter gaps)
+// ── FLIPPER GEOMETRY (canvas: y increases DOWN) ──────────────────────────────
+// LEFT flipper:  pivot=(157,748), REST angle=+0.44 (tip DOWN-right), ACTIVE=-0.44 (tip UP-right)
+// RIGHT flipper: pivot=(323,748), REST angle=PI-0.44 (tip DOWN-left), ACTIVE=PI+0.44 (tip UP-left)
+// REST tips at y≈782 (BELOW pivot), ACTIVE tips at y≈714 (ABOVE pivot)
+// Gap between tips: 21px (ball diameter 22px — ball barely passes, gutters on sides)
+const FL = {
+  leftX:157, rightX:323, y:748, len:80, w:12,
+  REST_L:   0.44,              // left flipper rest angle
+  ACT_L:   -0.44,              // left flipper active angle
+  REST_R:   Math.PI - 0.44,   // right flipper rest angle
+  ACT_R:    Math.PI + 0.44,   // right flipper active angle
+};
+// Drain y — ball drains if it passes below this (below REST tips at y≈782)
+const DRAIN_Y = 815;
+// Inlane guide walls
 const inlaneL=108, inlaneR=372;
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
@@ -193,15 +204,13 @@ function updatePlunge(dt){
     launchBall();
     return;
   }
-  // Keep ball sitting on plunger head — it moves UP as charge increases
-  // laneBot=PB.H-90, plunger compresses up to 60% of laneH
+  // Keep ball sitting on plunger head — moves UP as charge increases
   const laneBot=PB.H-90, laneTop=90, laneH=laneBot-laneTop;
   const charge=_pb.plungerCharge/PB.PLUNGER_MAX;
-  const springH=charge*laneH*0.6;
+  const springH=charge*laneH*0.62;
   const springY=laneBot-springH;
-  // Ball center sits just above plunger head (r=9) by ball radius (r=11)
   _pb.ball.x=PB.W-26;
-  _pb.ball.y=springY-9-PB.BALL_R;
+  _pb.ball.y=springY-9-PB.BALL_R; // ball center above plunger head
   _pb.ball.vx=0; _pb.ball.vy=0;
 }
 
@@ -220,188 +229,195 @@ function updatePlay(dt){
 }
 
 // ─── BALL PHYSICS ─────────────────────────────────────────────────────────────
+function flipAngle(f){
+  if(f.side==='left')  return f.active ? FL.ACT_L : FL.REST_L;
+  else                 return f.active ? FL.ACT_R : FL.REST_R;
+}
+
+function flipTip(f){
+  const a = flipAngle(f);
+  return { x: f.x + FL.len*Math.cos(a), y: f.y + FL.len*Math.sin(a) };
+}
+
 function updateBall(b,dt){
   if(!b.active||b.lost)return;
-  b.vy+=PB.GRAVITY*(b.z>0?0.55:1)*dt;
-  if(b.z>0){b.vz-=0.06*dt;b.z=Math.max(0,b.z+b.vz*dt);}
-  b.x+=b.vx*dt; b.y+=b.vy*dt;
-  b.vx*=Math.pow(PB.FRICTION,dt); b.vy*=Math.pow(PB.FRICTION,dt);
-  const spd=Math.hypot(b.vx,b.vy);
-  if(spd>32){b.vx=b.vx/spd*32;b.vy=b.vy/spd*32;}
-  if(spd<PB.MIN_SPEED&&b.z===0){b.vx=0;b.vy=0;}
-  wallBounce(b);
-  _pb.bumpers.forEach(bmp=>bumperHit(b,bmp));
-  _pb.slings.forEach(s=>slingHit(b,s));
-  _pb.targets.forEach(t=>targetHit(b,t));
-  _pb.dropBanks.forEach(bank=>bank.targets.forEach(t=>targetHit(b,t)));
-  _pb.kickers.forEach(k=>kickerHit(b,k));
-  _pb.flippers.forEach(f=>flipperHit(b,f));
-  checkRampEntry(b);
-  checkWormHoles(b);
-  checkLocks(b);
-  if(b.y>PB.H+40) b.lost=true;
-}
 
-function wallBounce(b){
-  const r=PB.BALL_R;
-  // Left wall
-  if(b.x-r<wallL){b.x=wallL+r;b.vx=Math.abs(b.vx)*PB.WALL_BOUNCE;snd('wall');}
-  // Right wall (but not plunger lane area)
-  const inPlungerLane=(b.x>wallR-8);
-  if(b.x+r>wallR&&!inPlungerLane){b.x=wallR-r;b.vx=-Math.abs(b.vx)*PB.WALL_BOUNCE;snd('wall');}
-  // Inlane guide walls — create the gutters
-  // Left gutter: if ball between wallL and inlaneL, it's in the gutter — bounces off inlane
-  if(b.x>wallL&&b.x<inlaneL&&b.x+r>inlaneL&&b.y<FL.y-10){
-    b.x=inlaneL-r; b.vx=-Math.abs(b.vx)*PB.WALL_BOUNCE;
-  }
-  // Right gutter
-  if(b.x>inlaneR&&b.x<wallR&&b.x-r<inlaneR&&b.y<FL.y-10){
-    b.x=inlaneR+r; b.vx=Math.abs(b.vx)*PB.WALL_BOUNCE;
-  }
-  // Top wall
-  if(b.y-r<wallT){b.y=wallT+r;b.vy=Math.abs(b.vy)*PB.WALL_BOUNCE;snd('wall');}
-  // Plunger lane right wall
-  if(inPlungerLane&&b.x+r>PB.W-8){b.x=PB.W-8-r;b.vx=-Math.abs(b.vx)*PB.WALL_BOUNCE;}
-  // Plunger lane left wall — ball can't cross into playfield until it goes high enough
-  // If ball is in plunger lane and hasn't reached exit height, bounce it back right
-  const exitY=PB.H-270; // y above which ball can exit to playfield
-  if(b.x>wallR-4&&b.y>exitY){
-    // Ball still in lane and below exit — keep it contained
-    if(b.x<wallR+4){b.x=wallR+4;b.vx=Math.abs(b.vx)*0.5;}
-  }
-  // Curved exit at TOP of plunger lane
-  // When ball travels up the lane and reaches near the top (y < 130),
-  // the curved guide deflects it LEFT onto the playfield
-  if(b.x>wallR-6&&b.y<130&&b.vy<0){
-    // Ball has reached the top of the lane — curve it left
-    b.vx=-Math.abs(b.vx)*0.7-5; // strong leftward kick
-    b.vy*=0.55;                   // reduce upward velocity (curving around the bend)
-    b.x=wallR-18;                 // move ball left of the lane wall
-    b.y=Math.max(b.y,wallT+PB.BALL_R+2); // keep above top wall
-  }
-  // If ball falls back into plunger lane after failed launch, allow relaunch
-  if(b.x>wallR-8&&b.vy>0&&b.y>PB.H-200&&_pb.phase==='play'){
-    // Ball fell back — reset to plunger bottom for relaunch
-    _pb.ball.x=PB.W-26;
-    _pb.ball.y=PB.H-110;
-    _pb.ball.vx=0; _pb.ball.vy=0;
-    _pb.phase='plunge'; _pb.plungerCharge=0;
-    _pb.dmdMsg='PULL AND RELEASE'; _pb.dmdSub='TRY AGAIN!'; _pb.dmdFlash=2;
-  }
-}
+  // ── Gravity ──────────────────────────────────────────────────────────────
+  b.vy += 0.30 * dt;
 
-function bumperHit(b,bmp){
-  const dx=b.x-bmp.x,dy=b.y-bmp.y,d=Math.hypot(dx,dy);
-  // cooldown: ignore for 120ms after last hit to prevent ping-pong
-  if(bmp.cooldown>0) return;
-  if(d<bmp.r+PB.BALL_R+1){
-    const nx=dx/d,ny=dy/d;
-    // Push ball fully outside bumper + small separation gap
-    b.x=bmp.x+nx*(bmp.r+PB.BALL_R+3);
-    b.y=bmp.y+ny*(bmp.r+PB.BALL_R+3);
-    // Set exit velocity — capped at BUMPER_FORCE, direction away from bumper
-    const exitSpd=Math.min(PB.BUMPER_FORCE, Math.max(6, Math.hypot(b.vx,b.vy)*0.8+4));
-    b.vx=nx*exitSpd; b.vy=ny*exitSpd;
-    bmp.cooldown=0.14;  // 140ms cooldown
-    bmp.hits++; bmp.flashTimer=0.38;
-    const pts=bmp.pts*_pb.multiplier;
-    addPts(pts,bmp.x,bmp.y);
-    _pb.combo++; _pb.comboTimer=3;
-    _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r,life:0.45,max:0.45,color:bmp.ring,type:'ring'});
-    _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r*0.5,life:0.25,max:0.25,color:'#ffffff',type:'fill'});
-    _pb.strobes.push({x:bmp.x,y:bmp.y,r:bmp.r*3.5,life:0.35,max:0.35,color:bmp.ring});
-    snd('bumper');
-    _table.onBumper&&_table.onBumper(bmp);
-  }
-  if(bmp.flashTimer>0) bmp.flashTimer=Math.max(0,bmp.flashTimer-0.016);
-  if(bmp.cooldown>0)   bmp.cooldown=Math.max(0,bmp.cooldown-0.016);
-}
+  // ── Move ─────────────────────────────────────────────────────────────────
+  b.x += b.vx * dt;
+  b.y += b.vy * dt;
 
-function slingHit(b,s){
-  // Slingshot — triangular kicker on sides
-  // Simple: if ball hits the sling rect, kick it away hard
-  const inX=b.x>s.x&&b.x<s.x+s.w;
-  const inY=b.y>s.y&&b.y<s.y+s.h;
-  if(inX&&inY){
-    b.vx=s.kickVx+(Math.random()-0.5)*2;
-    b.vy=s.kickVy;
-    addPts(s.pts*_pb.multiplier,s.x+s.w/2,s.y+s.h/2);
-    _pb.pulses.push({x:s.x+s.w/2,y:s.y+s.h/2,r:20,life:0.2,max:0.2,color:s.color,type:'ring'});
-    snd('bumper');
-  }
-}
+  // ── Speed cap ────────────────────────────────────────────────────────────
+  const spd = Math.hypot(b.vx, b.vy);
+  if(spd > 28){ const s=28/spd; b.vx*=s; b.vy*=s; }
+  b.vx *= 0.9994; b.vy *= 0.9994; // very light friction
 
-function targetHit(b,t){
-  if(t.hit)return;
-  const inX=b.x+PB.BALL_R>t.x&&b.x-PB.BALL_R<t.x+t.w;
-  const inY=b.y+PB.BALL_R>t.y&&b.y-PB.BALL_R<t.y+t.h;
-  if(inX&&inY){
-    t.hit=true; t.flashTimer=0.5;
-    addPts(t.pts*_pb.multiplier,t.x+t.w/2,t.y+t.h/2);
-    _pb.pulses.push({x:t.x+t.w/2,y:t.y+t.h/2,r:18,life:0.35,max:0.35,color:t.color,type:'ring'});
-    b.vy=-Math.abs(b.vy)*0.65; b.vx+=(Math.random()-0.5)*3;
-    snd('target');
-    checkGroup(t.group);
-  }
-  if(t.flashTimer>0)t.flashTimer=Math.max(0,t.flashTimer-0.016);
-}
+  // ── Wall collisions ───────────────────────────────────────────────────────
+  const r = PB.BALL_R;
+  if(b.x - r < wallL){ b.x = wallL+r; b.vx = Math.abs(b.vx)*0.60; snd('wall'); }
+  if(b.x + r > wallR){ b.x = wallR-r; b.vx = -Math.abs(b.vx)*0.60; snd('wall'); }
+  if(b.y - r < wallT){ b.y = wallT+r; b.vy = Math.abs(b.vy)*0.60; snd('wall'); }
 
-function kickerHit(b,k){
-  const d=Math.hypot(b.x-k.x,b.y-k.y);
-  if(d<k.r+PB.BALL_R){
-    b.vx=k.vx; b.vy=k.vy;
-    addPts(k.pts*_pb.multiplier,k.x,k.y);
-    _pb.pulses.push({x:k.x,y:k.y,r:k.r*2,life:0.4,max:0.4,color:k.color,type:'ring'});
-    snd('bumper');
-  }
-}
-
-function flipperHit(b,f){
-  const a=flipAngle(f);
-  const cos=Math.cos(a),sin=Math.sin(a);
-  const tx=f.x+cos*f.len,ty=f.y+sin*f.len;
-  const dx=tx-f.x,dy=ty-f.y,lenSq=dx*dx+dy*dy;
-  let t=((b.x-f.x)*dx+(b.y-f.y)*dy)/lenSq;
-  t=Math.max(0,Math.min(1,t));
-  const cx=f.x+t*dx,cy=f.y+t*dy;
-  const ex=b.x-cx,ey=b.y-cy,ed=Math.hypot(ex,ey);
-  const thick=f.w/2+PB.BALL_R;
-  if(ed<thick){
-    const nx=ex/ed,ny=ey/ed;
-    b.x=cx+nx*(thick+0.5); b.y=cy+ny*(thick+0.5);
-    const dot=b.vx*nx+b.vy*ny;
-    b.vx-=2*dot*nx; b.vy-=2*dot*ny;
-    if(f.active){
-      const boost=f.side==='left'?1:-1;
-      b.vy+=f.active?-PB.FLIPPER_FORCE:0;
-      b.vx+=boost*(PB.FLIPPER_FORCE*0.25);
-      snd('flipper');
+  // ── Plunger lane right wall ───────────────────────────────────────────────
+  // Ball in plunger lane (x > wallR-8) bounces off PB.W-8
+  if(b.x > wallR-8){
+    if(b.x + r > PB.W-8){ b.x=PB.W-8-r; b.vx=-Math.abs(b.vx)*0.55; }
+    // Exit arc at top: when ball rises above y=120, kick left onto playfield
+    if(b.y < 120 && b.vy < 0){
+      b.vx = -Math.abs(b.vx)*0.6 - 5;
+      b.vy *= 0.5;
+      b.x = wallR - 20;
     }
+    // Ball falls back — reset to plunge
+    if(b.vy > 0 && b.y > PB.H - 180 && _pb.phase === 'play'){
+      b.x=PB.W-26; b.y=PB.H-110; b.vx=0; b.vy=0;
+      _pb.phase='plunge'; _pb.plungerCharge=0;
+      dmd('PULL AND RELEASE','TRY AGAIN!');
+    }
+    return; // don't apply other physics while in plunger lane
   }
-}
 
-function flipAngle(f){
-  // Left flipper: pivot left, tip right
-  //   REST: angle=+restAngle (tip points DOWN-right, natural hang)
-  //   ACTIVE: angle=-activeAngle (tip swings UP-right)
-  // Right flipper: pivot right, tip left
-  //   REST: angle=PI-restAngle (tip points DOWN-left)
-  //   ACTIVE: angle=PI+activeAngle (tip swings UP-left)
-  if(f.side==='left'){
-    return f.active ? -FL.activeAngle : FL.restAngle;
-  } else {
-    return f.active ? Math.PI+FL.activeAngle : Math.PI-FL.restAngle;
-  }
-}
-
-function updateFlippers(dt){
-  _pb.flippers.forEach(f=>{
-    const want=(f.side==='left'&&_keys.left)||(f.side==='right'&&_keys.right);
-    if(want!==f.active){f.active=want;if(want)snd('flipper');}
+  // ── Bumpers ───────────────────────────────────────────────────────────────
+  _pb.bumpers.forEach(bmp => {
+    if(bmp.cooldown > 0){ bmp.cooldown -= dt; return; }
+    const dx=b.x-bmp.x, dy=b.y-bmp.y, d=Math.hypot(dx,dy);
+    if(d < bmp.r + r){
+      const nx=dx/d||0, ny=dy/d||1;
+      // Push ball cleanly outside
+      b.x = bmp.x + nx*(bmp.r+r+2);
+      b.y = bmp.y + ny*(bmp.r+r+2);
+      // Exit velocity: away from bumper, minimum speed
+      const exitSpd = Math.max(8, spd*0.7+5);
+      b.vx = nx*exitSpd; b.vy = ny*exitSpd;
+      bmp.cooldown = 0.15;
+      bmp.hits++; bmp.flashTimer = 0.4;
+      addPts(bmp.pts*_pb.multiplier, bmp.x, bmp.y);
+      _pb.combo++; _pb.comboTimer = 3;
+      _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r,life:0.45,max:0.45,color:bmp.ring,type:'ring'});
+      _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r*0.4,life:0.2,max:0.2,color:'#fff',type:'fill'});
+      _pb.strobes.push({x:bmp.x,y:bmp.y,r:bmp.r*3.5,life:0.3,max:0.3,color:bmp.ring});
+      snd('bumper');
+      _table.onBumper && _table.onBumper(bmp);
+    }
+    if(bmp.flashTimer > 0) bmp.flashTimer -= dt;
   });
+
+  // ── Slingshots ────────────────────────────────────────────────────────────
+  _pb.slings.forEach(s => {
+    if(b.x+r>s.x && b.x-r<s.x+s.w && b.y+r>s.y && b.y-r<s.y+s.h){
+      b.vx = s.kickVx + (Math.random()-0.5)*1.5;
+      b.vy = s.kickVy - Math.random()*1.5;
+      addPts(s.pts*_pb.multiplier, s.x+s.w/2, s.y+s.h/2);
+      _pb.pulses.push({x:s.x+s.w/2,y:s.y+s.h/2,r:22,life:0.22,max:0.22,color:s.color,type:'ring'});
+      snd('bumper');
+    }
+  });
+
+  // ── Drop targets — SOLID even when hit ───────────────────────────────────
+  // Targets remain as physical walls regardless of hit state
+  // Hitting them just changes their visual color
+  const allTargets = [
+    ..._pb.targets,
+    ..._pb.dropBanks.flatMap(bk=>bk.targets)
+  ];
+  allTargets.forEach(t => {
+    const inX = b.x+r > t.x && b.x-r < t.x+t.w;
+    const inY = b.y+r > t.y && b.y-r < t.y+t.h;
+    if(inX && inY){
+      // Determine which face ball hit (find shortest overlap axis)
+      const overlapL = (b.x+r) - t.x;
+      const overlapR = (t.x+t.w) - (b.x-r);
+      const overlapT = (b.y+r) - t.y;
+      const overlapB = (t.y+t.h) - (b.y-r);
+      const minH = Math.min(overlapL, overlapR);
+      const minV = Math.min(overlapT, overlapB);
+      if(minH < minV){
+        // Horizontal collision
+        if(overlapL < overlapR){ b.x=t.x-r; b.vx=-Math.abs(b.vx)*0.55; }
+        else                    { b.x=t.x+t.w+r; b.vx=Math.abs(b.vx)*0.55; }
+      } else {
+        // Vertical collision
+        if(overlapT < overlapB){ b.y=t.y-r; b.vy=-Math.abs(b.vy)*0.55; }
+        else                    { b.y=t.y+t.h+r; b.vy=Math.abs(b.vy)*0.55; }
+      }
+      // Score only on first hit
+      if(!t.hit){
+        t.hit=true; t.flashTimer=0.5;
+        addPts(t.pts*_pb.multiplier, t.x+t.w/2, t.y+t.h/2);
+        _pb.pulses.push({x:t.x+t.w/2,y:t.y+t.h/2,r:18,life:0.32,max:0.32,color:t.color,type:'ring'});
+        snd('target');
+        checkGroup(t.group);
+      }
+    }
+    if(t.flashTimer>0) t.flashTimer-=dt;
+  });
+
+  // ── Kicker holes ─────────────────────────────────────────────────────────
+  _pb.kickers.forEach(k => {
+    if(Math.hypot(b.x-k.x, b.y-k.y) < k.r+r){
+      b.vx=k.vx; b.vy=k.vy;
+      addPts(k.pts*_pb.multiplier, k.x, k.y);
+      _pb.pulses.push({x:k.x,y:k.y,r:k.r*2,life:0.4,max:0.4,color:k.color,type:'ring'});
+      snd('bumper');
+    }
+  });
+
+  // ── Flipper collision ─────────────────────────────────────────────────────
+  _pb.flippers.forEach(f => {
+    const a  = flipAngle(f);
+    const px = f.x, py = f.y;
+    const tx = px + FL.len*Math.cos(a), ty = py + FL.len*Math.sin(a);
+    // Project ball onto flipper line segment
+    const dx=tx-px, dy=ty-py, lenSq=dx*dx+dy*dy;
+    let t2 = ((b.x-px)*dx+(b.y-py)*dy)/lenSq;
+    t2 = Math.max(0, Math.min(1, t2));
+    const cx=px+t2*dx, cy=py+t2*dy;
+    const ex=b.x-cx, ey=b.y-cy, ed=Math.hypot(ex,ey);
+    const thick = FL.w/2 + r;
+    if(ed < thick && ed > 0){
+      const nx=ex/ed, ny=ey/ed;
+      // Push ball outside flipper surface
+      b.x = cx + nx*(thick+1);
+      b.y = cy + ny*(thick+1);
+      // Reflect velocity
+      const dot = b.vx*nx + b.vy*ny;
+      b.vx -= 2*dot*nx*0.65;
+      b.vy -= 2*dot*ny*0.65;
+      if(f.active){
+        // Add launch velocity component upward along flipper normal
+        const boost = f.side==='left' ? 1 : -1;
+        b.vy += ny < 0 ? -14 : -8;   // strong upward kick
+        b.vx += boost * 5;
+        snd('flipper');
+      }
+    }
+  });
+
+  // ── Lock holes ────────────────────────────────────────────────────────────
+  checkLocks(b);
+
+  // ── Ramp entry ───────────────────────────────────────────────────────────
+  checkRampEntry(b);
+
+  // ── Worm holes ────────────────────────────────────────────────────────────
+  checkWormHoles(b);
+
+  // ── Drain check ──────────────────────────────────────────────────────────
+  // Ball drains if it passes below DRAIN_Y (below flipper REST tips)
+  // OR if it falls into left/right gutters past the flipper pivots
+  const tip = flipTip(_pb.flippers[0]); // left flipper rest tip
+  const centerGapL = tip.x;
+  const centerGapR = PB.W - tip.x; // symmetric
+  const pastFlippers = b.y > FL.y + 50; // clearly below pivot
+  const inGutter = (b.x < inlaneL && b.y > FL.y - 20) ||
+                   (b.x > inlaneR && b.y > FL.y - 20);
+  const inCenterDrain = b.x > centerGapL - 5 && b.x < centerGapR + 5 && b.y > DRAIN_Y;
+  if(inCenterDrain || inGutter){ b.lost=true; }
 }
 
-// ─── RAMPS ────────────────────────────────────────────────────────────────────
+
 function checkRampEntry(b){
   if(b.z>0)return;
   _pb.ramps.forEach(r=>{
@@ -590,9 +606,8 @@ function buildTable(id){
 // Standard flipper pair (all tables share this base)
 function stdFlippers(extraFlippers=[]){
   return [
-    // angle field not used directly — flipAngle() calculates from FL constants
-    {x:FL.leftX,  y:FL.y, len:FL.len, w:FL.w, side:'left',  active:false, z:0},
-    {x:FL.rightX, y:FL.y, len:FL.len, w:FL.w, side:'right', active:false, z:0},
+    {x:FL.leftX,  y:FL.y, len:FL.len, w:FL.w, side:'left',  active:false},
+    {x:FL.rightX, y:FL.y, len:FL.len, w:FL.w, side:'right', active:false},
     ...extraFlippers
   ];
 }
@@ -1035,27 +1050,36 @@ function drawField(ctx){
   // Rail
   ctx.fillStyle=t.railColor||'#0022aa';
   ctx.fillRect(wallL-4,0,4,PB.H); ctx.fillRect(wallR,0,4,PB.H);
-  // Inlane guides — create gutter on each side of flippers
+  // Inlane guide lines (upper section only — below this is open gutter)
   ctx.strokeStyle=t.inlaneColor||'#001166';
   ctx.lineWidth=3;
-  ctx.beginPath();ctx.moveTo(inlaneL,FL.y+20);ctx.lineTo(inlaneL,FL.y-200);ctx.stroke();
-  ctx.beginPath();ctx.moveTo(inlaneR,FL.y+20);ctx.lineTo(inlaneR,FL.y-200);ctx.stroke();
-  // Bottom drain shape — angle from wall to just inside flipper pivots
+  ctx.beginPath();ctx.moveTo(inlaneL,FL.y-30);ctx.lineTo(inlaneL,FL.y-220);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(inlaneR,FL.y-30);ctx.lineTo(inlaneR,FL.y-220);ctx.stroke();
+
+  // Bottom section: angled guide rails from wall to flipper pivot area
+  // These are the slanted walls that funnel ball toward flippers
+  ctx.strokeStyle=t.railColor||'#0022aa';
+  ctx.lineWidth=5; ctx.lineCap='round';
+  // Left guide rail: from wallL down to just left of left pivot
+  ctx.beginPath();
+  ctx.moveTo(inlaneL, FL.y - 30);
+  ctx.lineTo(wallL+2, FL.y + 40);
+  ctx.stroke();
+  // Right guide rail
+  ctx.beginPath();
+  ctx.moveTo(inlaneR, FL.y - 30);
+  ctx.lineTo(wallR-2, FL.y + 40);
+  ctx.stroke();
+
+  // Solid drain wall below flippers (ball disappears here)
   ctx.fillStyle=t.wallColor||'#06061a';
-  // Left drain gutter
-  ctx.beginPath();
-  ctx.moveTo(wallL,PB.H-70);
-  ctx.lineTo(wallL,PB.H+2);
-  ctx.lineTo(inlaneL+2,PB.H-30);
-  ctx.lineTo(inlaneL+2,PB.H-70);
-  ctx.fill();
-  // Right drain gutter
-  ctx.beginPath();
-  ctx.moveTo(wallR,PB.H-70);
-  ctx.lineTo(wallR,PB.H+2);
-  ctx.lineTo(inlaneR-2,PB.H-30);
-  ctx.lineTo(inlaneR-2,PB.H-70);
-  ctx.fill();
+  ctx.fillRect(0, DRAIN_Y+2, PB.W, PB.H-DRAIN_Y);
+
+  // Center drain slot visual (very subtle)
+  ctx.fillStyle='rgba(255,0,0,0.08)';
+  const tipL = FL.leftX + FL.len*Math.cos(FL.REST_L);
+  const tipR = FL.rightX + FL.len*Math.cos(FL.REST_R);
+  ctx.fillRect(tipL, FL.y+10, tipR-tipL, DRAIN_Y-FL.y-10);
   // Plunger lane
   ctx.fillStyle='rgba(255,255,255,0.025)';
   ctx.fillRect(wallR,PB.H-270,PB.W-wallR,270);
@@ -1358,17 +1382,34 @@ function drawStrobes(ctx){
 
 function drawFlippers(ctx){
   _pb.flippers.forEach(f=>{
-    const a=flipAngle(f);
-    const tx=f.x+Math.cos(a)*f.len, ty=f.y+Math.sin(a)*f.len;
-    const ac=_tdef?.accentColor||'#4488ff';
-    ctx.strokeStyle=f.active?'#fff':ac;
-    ctx.lineWidth=f.w; ctx.lineCap='round';
-    ctx.shadowColor=f.active?'#ffffff':ac;
-    ctx.shadowBlur=f.active?16:5;
-    ctx.beginPath();ctx.moveTo(f.x,f.y);ctx.lineTo(tx,ty);ctx.stroke();
-    ctx.shadowBlur=0;
-    ctx.fillStyle='#fff';
-    ctx.beginPath();ctx.arc(f.x,f.y,f.w/2+2,0,Math.PI*2);ctx.fill();
+    const a  = flipAngle(f);
+    const tx = f.x + FL.len*Math.cos(a);
+    const ty = f.y + FL.len*Math.sin(a);
+    const ac = _tdef?.accentColor||'#4488ff';
+    // Flipper body
+    ctx.strokeStyle = f.active ? '#ffffff' : ac;
+    ctx.lineWidth   = FL.w;
+    ctx.lineCap     = 'round';
+    ctx.shadowColor = f.active ? '#ffffff' : ac;
+    ctx.shadowBlur  = f.active ? 18 : 6;
+    ctx.beginPath();
+    ctx.moveTo(f.x, f.y);
+    ctx.lineTo(tx, ty);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    // Pivot circle
+    ctx.fillStyle  = '#ccc';
+    ctx.strokeStyle= f.active ? '#fff' : ac;
+    ctx.lineWidth  = 2;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, FL.w/2+3, 0, Math.PI*2);
+    ctx.fill();
+    ctx.stroke();
+    // Tip circle
+    ctx.fillStyle = f.active ? '#fff' : lhn(ac,0.3);
+    ctx.beginPath();
+    ctx.arc(tx, ty, FL.w/2, 0, Math.PI*2);
+    ctx.fill();
   });
 }
 
