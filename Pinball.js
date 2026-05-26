@@ -22,8 +22,11 @@ const PB = {
 
 // Playfield walls
 const wallL=44, wallR=436, wallT=18;
-// Flipper geometry — tuned so gap = ~22px (ball barely fits)
-const FL = { leftX:155, rightX:325, y:752, len:85, w:11, angle:0.52 };
+// Flipper geometry — REST = tip pointing DOWN (positive angle), ACTIVE = tip UP (negative)
+// Pivot L=154, R=326, len=82: rest gap=28px (>ball diameter 22px, gutters on each side)
+const FL = { leftX:154, rightX:326, y:752, len:82, w:11, restAngle:0.50, activeAngle:0.52 };
+// Side gutter inlane guide x positions (moved inward to create proper gutter gaps)
+const inlaneL=108, inlaneR=372;
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let _ov=null,_canvas=null,_dmd=null,_ctx=null,_dctx=null,_animId=null,_ac=null;
@@ -233,41 +236,72 @@ function wallBounce(b){
   // Left wall
   if(b.x-r<wallL){b.x=wallL+r;b.vx=Math.abs(b.vx)*PB.WALL_BOUNCE;snd('wall');}
   // Right wall (but not plunger lane area)
-  const inPlungerLane=(b.y>PB.H-260&&b.x>wallR-50);
+  const inPlungerLane=(b.x>wallR-8);
   if(b.x+r>wallR&&!inPlungerLane){b.x=wallR-r;b.vx=-Math.abs(b.vx)*PB.WALL_BOUNCE;snd('wall');}
+  // Inlane guide walls — create the gutters
+  // Left gutter: if ball between wallL and inlaneL, it's in the gutter — bounces off inlane
+  if(b.x>wallL&&b.x<inlaneL&&b.x+r>inlaneL&&b.y<FL.y-10){
+    b.x=inlaneL-r; b.vx=-Math.abs(b.vx)*PB.WALL_BOUNCE;
+  }
+  // Right gutter
+  if(b.x>inlaneR&&b.x<wallR&&b.x-r<inlaneR&&b.y<FL.y-10){
+    b.x=inlaneR+r; b.vx=Math.abs(b.vx)*PB.WALL_BOUNCE;
+  }
   // Top wall
   if(b.y-r<wallT){b.y=wallT+r;b.vy=Math.abs(b.vy)*PB.WALL_BOUNCE;snd('wall');}
   // Plunger lane right wall
   if(inPlungerLane&&b.x+r>PB.W-8){b.x=PB.W-8-r;b.vx=-Math.abs(b.vx)*PB.WALL_BOUNCE;}
-  // One-way deflector at top of plunger lane — forces ball left onto playfield
-  // Deflector: curved guide from (wallR, H-280) arcing to (wallR-60, H-320)
-  const defX=wallR, defY=PB.H-260;
-  if(b.x>defX-20&&b.y<defY&&b.y>defY-40&&b.vx>-3){
-    b.vx=-Math.abs(b.vx)*0.8-3;
-    b.vy=Math.min(b.vy,-2);
-    b.x=defX-20-r;
+  // Plunger lane left wall — ball can't cross into playfield until it goes high enough
+  // If ball is in plunger lane and hasn't reached exit height, bounce it back right
+  const exitY=PB.H-270; // y above which ball can exit to playfield
+  if(b.x>wallR-4&&b.y>exitY){
+    // Ball still in lane and below exit — keep it contained
+    if(b.x<wallR+4){b.x=wallR+4;b.vx=Math.abs(b.vx)*0.5;}
+  }
+  // One-way deflector at TOP of plunger lane — curved guide forces ball LEFT onto playfield
+  const defY=exitY;
+  if(b.x>wallR-25&&b.y<=defY+5&&b.y>=defY-50){
+    // Ball reached the exit — kick it left onto the playfield
+    if(b.vy<0){ // moving upward
+      b.vx=-Math.abs(b.vx)*0.9-4;
+      b.vy*=0.7;
+      b.x=wallR-26;
+    }
+  }
+  // If ball falls back into plunger lane (didn't have enough power), reset to plunger
+  if(b.x>wallR-4&&b.vy>0&&b.y>PB.H-180&&_pb.phase==='play'){
+    // Ball fell back into plunger — reset to plunge state
+    b.x=PB.W-26; b.y=90; b.vx=0; b.vy=0;
+    _pb.phase='plunge'; _pb.plungerCharge=0;
+    _pb.dmdMsg='PULL AND RELEASE'; _pb.dmdSub='TRY AGAIN!'; _pb.dmdFlash=2;
   }
 }
 
 function bumperHit(b,bmp){
   const dx=b.x-bmp.x,dy=b.y-bmp.y,d=Math.hypot(dx,dy);
+  // cooldown: ignore for 120ms after last hit to prevent ping-pong
+  if(bmp.cooldown>0) return;
   if(d<bmp.r+PB.BALL_R+1){
     const nx=dx/d,ny=dy/d;
-    b.x=bmp.x+nx*(bmp.r+PB.BALL_R+1);
-    b.vx=nx*PB.BUMPER_FORCE; b.vy=ny*PB.BUMPER_FORCE;
-    bmp.hits++; bmp.flashTimer=0.35;
+    // Push ball fully outside bumper + small separation gap
+    b.x=bmp.x+nx*(bmp.r+PB.BALL_R+3);
+    b.y=bmp.y+ny*(bmp.r+PB.BALL_R+3);
+    // Set exit velocity — capped at BUMPER_FORCE, direction away from bumper
+    const exitSpd=Math.min(PB.BUMPER_FORCE, Math.max(6, Math.hypot(b.vx,b.vy)*0.8+4));
+    b.vx=nx*exitSpd; b.vy=ny*exitSpd;
+    bmp.cooldown=0.14;  // 140ms cooldown
+    bmp.hits++; bmp.flashTimer=0.38;
     const pts=bmp.pts*_pb.multiplier;
     addPts(pts,bmp.x,bmp.y);
     _pb.combo++; _pb.comboTimer=3;
-    // Big visual flash
     _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r,life:0.45,max:0.45,color:bmp.ring,type:'ring'});
     _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r*0.5,life:0.25,max:0.25,color:'#ffffff',type:'fill'});
-    _pb.strobes.push({x:bmp.x,y:bmp.y,r:bmp.r*3,life:0.3,max:0.3,color:bmp.ring});
+    _pb.strobes.push({x:bmp.x,y:bmp.y,r:bmp.r*3.5,life:0.35,max:0.35,color:bmp.ring});
     snd('bumper');
     _table.onBumper&&_table.onBumper(bmp);
   }
-  // Decay flash
   if(bmp.flashTimer>0) bmp.flashTimer=Math.max(0,bmp.flashTimer-0.016);
+  if(bmp.cooldown>0)   bmp.cooldown=Math.max(0,bmp.cooldown-0.016);
 }
 
 function slingHit(b,s){
@@ -334,9 +368,17 @@ function flipperHit(b,f){
 }
 
 function flipAngle(f){
-  const rest=f.angle;
-  const active=f.side==='left'?rest+0.58:rest-0.58;
-  return f.active?active:rest;
+  // Left flipper: pivot left, tip right
+  //   REST: angle=+restAngle (tip points DOWN-right, natural hang)
+  //   ACTIVE: angle=-activeAngle (tip swings UP-right)
+  // Right flipper: pivot right, tip left
+  //   REST: angle=PI-restAngle (tip points DOWN-left)
+  //   ACTIVE: angle=PI+activeAngle (tip swings UP-left)
+  if(f.side==='left'){
+    return f.active ? -FL.activeAngle : FL.restAngle;
+  } else {
+    return f.active ? Math.PI+FL.activeAngle : Math.PI-FL.restAngle;
+  }
 }
 
 function updateFlippers(dt){
@@ -467,18 +509,20 @@ function dmd(msg,sub){_pb.dmdMsg=msg;_pb.dmdSub=sub||'';_pb.dmdFlash=2.5;}
 
 // ─── BALL START / END ─────────────────────────────────────────────────────────
 function startBall(){
-  _pb.ball={x:PB.W-28,y:PB.H-150,vx:0,vy:0,z:0,vz:0,active:true,lost:false};
+  // Spawn at TOP of plunger lane so player gets full plunger travel
+  _pb.ball={x:PB.W-26,y:90,vx:0,vy:0,z:0,vz:0,active:true,lost:false};
   _pb.extras=[]; _pb.plungerCharge=0; _pb.launched=false;
   _pb.targets.forEach(t=>t.hit=false);
   _pb.dropBanks.forEach(bk=>bk.targets.forEach(t=>t.hit=false));
+  _pb.bumpers.forEach(b=>{b.cooldown=0;b.flashTimer=0;});
   _pb.ballNum=4-_pb.ballsLeft;
   _pb.phase='plunge'; _pb.phaseTimer=0;
   dmd('PULL AND RELEASE','GOOD LUCK!');
 }
 
 function launchBall(){
-  _pb.ball.vy=-_pb.plungerCharge;
-  _pb.ball.vx=-0.3; // slight left nudge into table
+  _pb.ball.vy=-_pb.plungerCharge*1.1;
+  _pb.ball.vx=-0.2; // slight left nudge toward playfield
   _pb.plungerCharge=0; _pb.launched=true;
   _pb.phase='play';
   snd('launch');
@@ -528,8 +572,9 @@ function buildTable(id){
 // Standard flipper pair (all tables share this base)
 function stdFlippers(extraFlippers=[]){
   return [
-    {x:FL.leftX,  y:FL.y, angle:-FL.angle, len:FL.len, w:FL.w, side:'left',  active:false, z:0},
-    {x:FL.rightX, y:FL.y, angle:Math.PI+FL.angle, len:FL.len, w:FL.w, side:'right', active:false, z:0},
+    // angle field not used directly — flipAngle() calculates from FL constants
+    {x:FL.leftX,  y:FL.y, len:FL.len, w:FL.w, side:'left',  active:false, z:0},
+    {x:FL.rightX, y:FL.y, len:FL.len, w:FL.w, side:'right', active:false, z:0},
     ...extraFlippers
   ];
 }
@@ -544,14 +589,15 @@ function tableWormHoler(){
     {x:370,y:530,angle:Math.PI+0.42,len:55,w:9,side:'right',active:false,z:0},
   ]);
 
+  // Bumpers spread min 85px center-to-center to prevent ping-pong traps
   const bumpers=[
-    {x:175,y:195,r:26,label:'SOL',   pts:100,color:'#2244ff',ring:'#6699ff',hits:0,flashTimer:0},
-    {x:305,y:175,r:26,label:'VEGA',  pts:150,color:'#8822ff',ring:'#cc66ff',hits:0,flashTimer:0},
-    {x:240,y:250,r:22,label:'CORE',  pts:200,color:'#ff2244',ring:'#ff7799',hits:0,flashTimer:0},
-    {x:145,y:310,r:20,label:'NOVA',  pts:120,color:'#2266ff',ring:'#55aaff',hits:0,flashTimer:0},
-    {x:345,y:300,r:20,label:'CYGNUS',pts:120,color:'#9922ff',ring:'#dd66ff',hits:0,flashTimer:0},
-    {x:195,y:135,r:18,label:'DEEP',  pts:300,color:'#ff4400',ring:'#ff9966',hits:0,flashTimer:0},
-    {x:285,y:125,r:18,label:'VOID',  pts:300,color:'#4400ff',ring:'#8855ff',hits:0,flashTimer:0},
+    {x:168,y:210,r:24,label:'SOL',   pts:100,color:'#2244ff',ring:'#6699ff',hits:0,flashTimer:0,cooldown:0},
+    {x:312,y:190,r:24,label:'VEGA',  pts:150,color:'#8822ff',ring:'#cc66ff',hits:0,flashTimer:0,cooldown:0},
+    {x:240,y:265,r:22,label:'CORE',  pts:200,color:'#ff2244',ring:'#ff7799',hits:0,flashTimer:0,cooldown:0},
+    {x:152,y:335,r:20,label:'NOVA',  pts:120,color:'#2266ff',ring:'#55aaff',hits:0,flashTimer:0,cooldown:0},
+    {x:328,y:325,r:20,label:'CYGNUS',pts:120,color:'#9922ff',ring:'#dd66ff',hits:0,flashTimer:0,cooldown:0},
+    {x:178,y:142,r:18,label:'DEEP',  pts:300,color:'#ff4400',ring:'#ff9966',hits:0,flashTimer:0,cooldown:0},
+    {x:302,y:130,r:18,label:'VOID',  pts:300,color:'#4400ff',ring:'#8855ff',hits:0,flashTimer:0,cooldown:0},
   ];
 
   // Slingshots (triangular kickers on sides, classic pinball feature)
@@ -689,13 +735,13 @@ function tableBarfsHouse(){
   ]);
 
   const bumpers=[
-    {x:165,y:185,r:28,label:"BARF!",   pts:100,color:'#cc4400',ring:'#ff8844',hits:0,flashTimer:0},
-    {x:300,y:165,r:28,label:'SQUAWK!', pts:150,color:'#336600',ring:'#66dd00',hits:0,flashTimer:0},
-    {x:380,y:210,r:24,label:'CUSTOMER',pts:100,color:'#cc3300',ring:'#ff7744',hits:0,flashTimer:0},
-    {x:205,y:265,r:22,label:'TABLE 3', pts:200,color:'#774400',ring:'#cc8844',hits:0,flashTimer:0},
-    {x:330,y:290,r:22,label:'GRILL IT',pts:200,color:'#aa2200',ring:'#ff6644',hits:0,flashTimer:0},
-    {x:140,y:320,r:20,label:'HEALTH!', pts:300,color:'#dd0044',ring:'#ff5588',hits:0,flashTimer:0},
-    {x:255,y:145,r:18,label:'SPECIALS!',pts:250,color:'#886600',ring:'#ffcc44',hits:0,flashTimer:0},
+    {x:162,y:195,r:26,label:"BARF!",   pts:100,color:'#cc4400',ring:'#ff8844',hits:0,flashTimer:0,cooldown:0},
+    {x:295,y:172,r:26,label:'SQUAWK!', pts:150,color:'#336600',ring:'#66dd00',hits:0,flashTimer:0,cooldown:0},
+    {x:375,y:225,r:22,label:'CUSTOMER',pts:100,color:'#cc3300',ring:'#ff7744',hits:0,flashTimer:0,cooldown:0},
+    {x:200,y:272,r:20,label:'TABLE 3', pts:200,color:'#774400',ring:'#cc8844',hits:0,flashTimer:0,cooldown:0},
+    {x:328,y:305,r:20,label:'GRILL IT',pts:200,color:'#aa2200',ring:'#ff6644',hits:0,flashTimer:0,cooldown:0},
+    {x:142,y:338,r:20,label:'HEALTH!', pts:300,color:'#dd0044',ring:'#ff5588',hits:0,flashTimer:0,cooldown:0},
+    {x:252,y:148,r:18,label:'SPECIALS!',pts:250,color:'#886600',ring:'#ffcc44',hits:0,flashTimer:0,cooldown:0},
   ];
 
   const slings=[
@@ -814,13 +860,13 @@ function tableShowerDefense(){
   ]);
 
   const bumpers=[
-    {x:165,y:185,r:28,label:'SOAP',   pts:100,color:'#aaddff',ring:'#ddeeff',hits:0,flashTimer:0},
-    {x:305,y:168,r:28,label:'DUCK!',  pts:150,color:'#ffdd00',ring:'#ffe880',hits:0,flashTimer:0},
-    {x:380,y:215,r:24,label:'LOOFAH', pts:100,color:'#ff88aa',ring:'#ffbbcc',hits:0,flashTimer:0},
-    {x:205,y:265,r:22,label:'PLUNGE', pts:200,color:'#6688ff',ring:'#aabbff',hits:0,flashTimer:0},
-    {x:330,y:295,r:22,label:'SCRUB',  pts:200,color:'#44ccff',ring:'#88ddff',hits:0,flashTimer:0},
-    {x:148,y:320,r:20,label:'RINSE',  pts:300,color:'#00ccff',ring:'#66ddff',hits:0,flashTimer:0},
-    {x:255,y:145,r:18,label:'SPONGE', pts:250,color:'#ffcc88',ring:'#ffddb0',hits:0,flashTimer:0},
+    {x:162,y:195,r:26,label:'SOAP',   pts:100,color:'#aaddff',ring:'#ddeeff',hits:0,flashTimer:0,cooldown:0},
+    {x:300,y:172,r:26,label:'DUCK!',  pts:150,color:'#ffdd00',ring:'#ffe880',hits:0,flashTimer:0,cooldown:0},
+    {x:378,y:222,r:22,label:'LOOFAH', pts:100,color:'#ff88aa',ring:'#ffbbcc',hits:0,flashTimer:0,cooldown:0},
+    {x:200,y:272,r:20,label:'PLUNGE', pts:200,color:'#6688ff',ring:'#aabbff',hits:0,flashTimer:0,cooldown:0},
+    {x:328,y:302,r:20,label:'SCRUB',  pts:200,color:'#44ccff',ring:'#88ddff',hits:0,flashTimer:0,cooldown:0},
+    {x:145,y:338,r:20,label:'RINSE',  pts:300,color:'#00ccff',ring:'#66ddff',hits:0,flashTimer:0,cooldown:0},
+    {x:252,y:148,r:18,label:'SPONGE', pts:250,color:'#ffcc88',ring:'#ffddb0',hits:0,flashTimer:0,cooldown:0},
   ];
 
   const slings=[
@@ -971,15 +1017,27 @@ function drawField(ctx){
   // Rail
   ctx.fillStyle=t.railColor||'#0022aa';
   ctx.fillRect(wallL-4,0,4,PB.H); ctx.fillRect(wallR,0,4,PB.H);
-  // Inlane guides
+  // Inlane guides — create gutter on each side of flippers
   ctx.strokeStyle=t.inlaneColor||'#001166';
   ctx.lineWidth=3;
-  ctx.beginPath();ctx.moveTo(88,FL.y-10);ctx.lineTo(88,FL.y-175);ctx.stroke();
-  ctx.beginPath();ctx.moveTo(PB.W-88,FL.y-10);ctx.lineTo(PB.W-88,FL.y-175);ctx.stroke();
-  // Bottom drain shape
+  ctx.beginPath();ctx.moveTo(inlaneL,FL.y+20);ctx.lineTo(inlaneL,FL.y-200);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(inlaneR,FL.y+20);ctx.lineTo(inlaneR,FL.y-200);ctx.stroke();
+  // Bottom drain shape — angle from wall to just inside flipper pivots
   ctx.fillStyle=t.wallColor||'#06061a';
-  ctx.beginPath();ctx.moveTo(wallL,PB.H-55);ctx.lineTo(wallL,PB.H);ctx.lineTo(FL.leftX-PB.BALL_R*2,PB.H-35);ctx.fill();
-  ctx.beginPath();ctx.moveTo(wallR,PB.H-55);ctx.lineTo(wallR,PB.H);ctx.lineTo(FL.rightX+PB.BALL_R*2,PB.H-35);ctx.fill();
+  // Left drain gutter
+  ctx.beginPath();
+  ctx.moveTo(wallL,PB.H-70);
+  ctx.lineTo(wallL,PB.H+2);
+  ctx.lineTo(inlaneL+2,PB.H-30);
+  ctx.lineTo(inlaneL+2,PB.H-70);
+  ctx.fill();
+  // Right drain gutter
+  ctx.beginPath();
+  ctx.moveTo(wallR,PB.H-70);
+  ctx.lineTo(wallR,PB.H+2);
+  ctx.lineTo(inlaneR-2,PB.H-30);
+  ctx.lineTo(inlaneR-2,PB.H-70);
+  ctx.fill();
   // Plunger lane
   ctx.fillStyle='rgba(255,255,255,0.025)';
   ctx.fillRect(wallR,PB.H-270,PB.W-wallR,270);
@@ -1017,32 +1075,84 @@ function drawSlingshots(ctx){
 function drawRamps(ctx){
   _pb.ramps.forEach(r=>{
     const lit=r.lit;
-    ctx.globalAlpha=lit?0.75:0.38;
+    const t=_pb.phaseTimer;
+
+    // 3D shadow underneath ramp (gives height illusion)
+    ctx.globalAlpha=0.35;
+    ctx.strokeStyle='rgba(0,0,0,0.8)';
+    ctx.lineWidth=18; ctx.lineCap='round';
+    ctx.beginPath();
+    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x+3,p.y+5):ctx.lineTo(p.x+3,p.y+5));
+    ctx.stroke();
+
+    // Ramp body — wide, colored, shows elevation
+    ctx.globalAlpha=lit?0.88:0.52;
     ctx.strokeStyle=r.color;
-    ctx.lineWidth=12; ctx.lineCap='round';
+    ctx.lineWidth=16; ctx.lineCap='round';
     ctx.beginPath();
     r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
     ctx.stroke();
-    ctx.globalAlpha=lit?0.5:0.12;
-    ctx.strokeStyle='#ffffff';
+
+    // Dark edge (bottom of ramp — thickness illusion)
+    ctx.globalAlpha=lit?0.6:0.3;
+    ctx.strokeStyle=dkn(r.color,0.5);
+    ctx.lineWidth=18; ctx.lineCap='round';
+    ctx.lineJoin='round';
+    // Offset slightly down
+    ctx.beginPath();
+    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y+4):ctx.lineTo(p.x,p.y+4));
+    ctx.stroke();
+
+    // Top highlight (light catching ramp surface)
+    ctx.globalAlpha=lit?0.6:0.18;
+    ctx.strokeStyle='rgba(255,255,255,0.9)';
     ctx.lineWidth=3;
     ctx.beginPath();
-    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y-2):ctx.lineTo(p.x,p.y-2));
     ctx.stroke();
+
+    // Animated travel arrows when lit
+    if(lit){
+      const arrowAnim=Math.floor(t*6)%r.path.length;
+      r.path.forEach((p,i)=>{
+        const active=i===arrowAnim;
+        ctx.globalAlpha=active?1:0.45;
+        ctx.fillStyle=active?'#ffffff':lhn(r.color,0.3);
+        ctx.font=`bold ${active?13:10}px monospace`;
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.shadowColor=active?'#fff':'transparent';
+        ctx.shadowBlur=active?8:0;
+        ctx.fillText('▲',p.x,p.y-8);
+        ctx.shadowBlur=0;
+      });
+    }
+
     ctx.globalAlpha=1;
-    // Arrow indicators along ramp
-    if(r.path.length>=2&&r.lit){
-      const mid=r.path[Math.floor(r.path.length/2)];
-      ctx.fillStyle=r.color; ctx.font='bold 11px monospace';
-      ctx.textAlign='center'; ctx.fillText('▲',mid.x,mid.y);
-    }
-    // Label
+
+    // Entry indicator — glowing circle at ramp mouth
+    const ep=r.path[0];
+    ctx.strokeStyle=lit?'#ffffff':r.color;
+    ctx.lineWidth=2;
+    ctx.shadowColor=r.color; ctx.shadowBlur=lit?12:4;
+    ctx.beginPath();ctx.arc(ep.x,ep.y,10,0,Math.PI*2);ctx.stroke();
+    ctx.shadowBlur=0;
+
+    // Label at entry
     if(r.label){
-      const ep=r.path[0];
-      ctx.fillStyle=lit?'#fff':'rgba(200,200,255,0.45)';
-      ctx.font='8px monospace'; ctx.textAlign='center';
-      ctx.fillText(r.label,ep.x+(ep.x<PB.W/2?18:-18),ep.y-6);
+      const side=ep.x<PB.W/2;
+      ctx.fillStyle=lit?'#fff':'rgba(200,200,255,0.55)';
+      ctx.font='bold 8px monospace'; ctx.textAlign='center';
+      ctx.shadowColor=r.color; ctx.shadowBlur=lit?6:0;
+      ctx.fillText(r.label,ep.x+(side?22:-22),ep.y-4);
+      ctx.shadowBlur=0;
     }
+
+    // Exit point marker
+    const ex=r.exitX,ey=r.exitY;
+    ctx.globalAlpha=0.5;
+    ctx.fillStyle=r.color;
+    ctx.beginPath();ctx.arc(ex,ey,5,0,Math.PI*2);ctx.fill();
+    ctx.globalAlpha=1;
   });
 }
 
@@ -1230,18 +1340,39 @@ function drawFlippers(ctx){
 
 function drawPlunger(ctx){
   if(_pb.phase!=='plunge')return;
-  const px=PB.W-22, baseY=PB.H-90, maxH=90;
+  // Plunger runs full lane height — ball at top, plunger spring at bottom
+  const px=PB.W-26, laneTop=90, laneBot=PB.H-90;
+  const laneH=laneBot-laneTop;
   const charge=_pb.plungerCharge/PB.PLUNGER_MAX;
-  ctx.strokeStyle='#333';ctx.lineWidth=8;ctx.lineCap='round';
-  ctx.beginPath();ctx.moveTo(px,baseY);ctx.lineTo(px,baseY-maxH);ctx.stroke();
-  const barH=charge*maxH;
-  const col=charge<0.45?'#44ff88':charge<0.78?'#ffcc00':'#ff4400';
-  ctx.strokeStyle=col;ctx.lineWidth=10;
-  ctx.shadowColor=col;ctx.shadowBlur=12;
-  ctx.beginPath();ctx.moveTo(px,baseY);ctx.lineTo(px,baseY-barH);ctx.stroke();
+  // Lane track
+  ctx.strokeStyle='#222';ctx.lineWidth=6;ctx.lineCap='round';
+  ctx.beginPath();ctx.moveTo(px,laneTop);ctx.lineTo(px,laneBot);ctx.stroke();
+  // Spring compression bar (draws up from bottom as charge increases)
+  const springH=charge*laneH*0.6; // spring compresses up to 60% of lane
+  const springY=laneBot-springH;
+  const col=charge<0.4?'#44ff88':charge<0.75?'#ffcc00':'#ff4400';
+  ctx.strokeStyle=col;ctx.lineWidth=9;
+  ctx.shadowColor=col;ctx.shadowBlur=14;
+  ctx.beginPath();ctx.moveTo(px,laneBot);ctx.lineTo(px,springY);ctx.stroke();
   ctx.shadowBlur=0;
-  ctx.fillStyle='#ccc';
-  ctx.beginPath();ctx.arc(px,baseY-barH,8,0,Math.PI*2);ctx.fill();
+  // Plunger head (tip of spring, moves up with charge)
+  ctx.fillStyle='#ddd';ctx.strokeStyle=col;ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(px,springY,9,0,Math.PI*2);ctx.fill();ctx.stroke();
+  // Ball sitting at top waiting to be launched
+  const bc=_tdef?.ballColor||'#c0e0ff';
+  const gr=ctx.createRadialGradient(px-3,laneTop-3,0,px,laneTop,PB.BALL_R);
+  gr.addColorStop(0,'#fff');gr.addColorStop(0.4,bc);gr.addColorStop(1,dkn(bc,0.5));
+  ctx.fillStyle=gr;ctx.shadowColor=bc;ctx.shadowBlur=8;
+  ctx.beginPath();ctx.arc(px,laneTop,PB.BALL_R,0,Math.PI*2);ctx.fill();
+  ctx.shadowBlur=0;
+  // Hint text
+  if(charge<0.05){
+    ctx.fillStyle='rgba(255,255,255,0.4)';ctx.font='8px monospace';ctx.textAlign='center';
+    ctx.fillText('HOLD LAUNCH',px,laneBot+14);
+  } else {
+    ctx.fillStyle=col;ctx.font='bold 9px monospace';ctx.textAlign='center';
+    ctx.fillText('RELEASE!',px,laneBot+14);
+  }
 }
 
 function drawBall(ctx,b){
