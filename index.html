@@ -1,128 +1,157 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-  <title>Pinball Buddy</title>
-  <style>
-    * { box-sizing:border-box; margin:0; padding:0; }
-    body {
-      background:#000;color:#fff;font-family:monospace;
-      min-height:100vh;display:flex;align-items:center;justify-content:center;
-      overflow:hidden;
-    }
-    #lobby {
-      text-align:center;padding:20px;max-width:520px;width:100%;
-    }
-    .pb-logo {
-      font-size:clamp(28px,6vw,48px);font-weight:900;letter-spacing:0.1em;
-      background:linear-gradient(135deg,#ff2070,#4400ff,#00d4ff);
-      -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
-      margin-bottom:6px;
-    }
-    .pb-tagline { color:#666;font-size:12px;margin-bottom:28px;letter-spacing:0.1em; }
-    .table-grid { display:flex;flex-direction:column;gap:10px;margin-bottom:24px; }
-    .table-card {
-      background:#111;border:1px solid #333;border-radius:10px;
-      padding:16px 20px;cursor:pointer;text-align:left;
-      transition:border-color 0.15s,background 0.15s;
-      display:flex;align-items:center;gap:16px;
-    }
-    .table-card:hover { border-color:#888;background:#181818; }
-    .table-card:active { background:#222; }
-    .table-icon {
-      width:50px;height:50px;border-radius:8px;flex-shrink:0;
-      display:flex;align-items:center;justify-content:center;font-size:24px;
-    }
-    .table-info { flex:1; }
-    .table-name { font-size:16px;font-weight:bold;margin-bottom:2px; }
-    .table-sub  { font-size:11px;color:#666; }
-    .table-hi   { font-size:10px;margin-top:4px;color:#888; }
-    .pb-footer  { color:#333;font-size:10px;margin-top:16px; }
-    .pb-footer a { color:#555;text-decoration:none; }
-    .controls-hint {
-      background:#0a0a0a;border:1px solid #222;border-radius:8px;
-      padding:10px 16px;margin-bottom:16px;font-size:10px;color:#555;
-      display:grid;grid-template-columns:1fr 1fr;gap:4px;text-align:left;
-    }
-    .controls-hint span { color:#888; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Pinball Buddy</title>
+<style>
+  :root{
+    --bg:#05050f; --panel:#120c2e; --neon:#ff3ea5; --neon2:#39d7ff;
+    --wall:#5b4b9e; --dim:#8a7fb5;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;}
+  body{
+    background:radial-gradient(ellipse at 50% 0%, #1a1145 0%, #05050f 70%);
+    color:#fff; font-family:'Courier New',monospace;
+    min-height:100%; display:flex; flex-direction:column; align-items:center;
+    padding:32px 16px 48px;
+  }
+  /* starfield */
+  body::before{
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+    background-image:
+      radial-gradient(1px 1px at 20% 30%, #fff8 50%, transparent),
+      radial-gradient(1px 1px at 70% 60%, #fff6 50%, transparent),
+      radial-gradient(2px 2px at 40% 80%, #39d7ff66 50%, transparent),
+      radial-gradient(1px 1px at 85% 15%, #ff3ea566 50%, transparent),
+      radial-gradient(1px 1px at 55% 45%, #fff5 50%, transparent);
+    background-size:cover;
+  }
+  .wrap{position:relative; z-index:1; width:100%; max-width:760px;}
+  header{text-align:center; margin-bottom:8px;}
+  h1{
+    font-size:clamp(34px,8vw,58px); letter-spacing:3px; line-height:1;
+    color:var(--neon);
+    text-shadow:0 0 18px var(--neon), 0 0 40px rgba(255,62,165,0.4);
+  }
+  h1 .b{color:var(--neon2); text-shadow:0 0 18px var(--neon2);}
+  .tag{color:var(--dim); font-size:13px; letter-spacing:4px; margin-top:8px;}
+  .ver{color:var(--wall); font-size:11px; letter-spacing:2px; margin-top:4px;}
+
+  .grid{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+    gap:18px; margin-top:34px;
+  }
+  .card{
+    position:relative; border:2px solid var(--wall); border-radius:14px;
+    padding:22px 20px 20px; cursor:pointer; overflow:hidden;
+    background:linear-gradient(160deg,#1a1145 0%,#0a0a1f 100%);
+    transition:transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+  }
+  .card:hover{
+    transform:translateY(-4px);
+    border-color:var(--accent);
+    box-shadow:0 10px 30px rgba(0,0,0,0.6), 0 0 26px var(--glow);
+  }
+  .card .glow{
+    position:absolute; inset:-40% -40% auto auto; width:160px; height:160px;
+    border-radius:50%; filter:blur(40px); opacity:.45;
+    background:var(--accent); pointer-events:none;
+  }
+  .card h2{
+    font-size:24px; letter-spacing:1px; color:var(--accent);
+    text-shadow:0 0 12px var(--glow); position:relative;
+  }
+  .card .sub{color:var(--dim); font-size:12px; margin-top:6px; letter-spacing:1px;}
+  .card .desc{color:#cfc8e8; font-size:12px; margin-top:14px; line-height:1.5;}
+  .card .badge{
+    display:inline-block; margin-top:16px; font-size:11px; letter-spacing:1px;
+    padding:5px 12px; border-radius:20px; font-weight:bold;
+  }
+  .badge.play{background:var(--neon2); color:#05050f;}
+  .badge.soon{background:#2a2a3a; color:var(--dim); border:1px solid var(--wall);}
+  .card.locked{cursor:not-allowed; opacity:.82;}
+  .card.locked:hover{transform:none;}
+
+  footer{margin-top:40px; text-align:center; color:var(--wall); font-size:11px;
+    letter-spacing:1px; line-height:1.7;}
+  footer a{color:var(--neon2); text-decoration:none;}
+  .hint{margin-top:22px; text-align:center; color:var(--dim); font-size:12px;}
+</style>
 </head>
 <body>
-<div id="lobby">
-  <div class="pb-logo">PINBALL BUDDY</div>
-  <div class="pb-tagline">3 TABLES · INFINITE TILT · ZERO EXCUSES</div>
+<div class="wrap">
+  <header>
+    <h1>PINBALL <span class="b">BUDDY</span></h1>
+    <div class="tag">SELECT YOUR TABLE</div>
+    <div class="ver" id="ver">v0.004.1</div>
+  </header>
 
-  <div class="controls-hint">
-    <div><span>← →</span> Arrow keys / Buttons</div>
-    <div><span>Space</span> Plunger / Launch</div>
-    <div><span>Touch</span> On-screen buttons</div>
-    <div><span>Esc</span> Quit table</div>
+  <div class="grid" id="grid"><!-- cards injected --></div>
+
+  <div class="hint">
+    Desktop: ◀ ▶ arrows = flippers · SPACE = plunger · ESC = exit<br>
+    Mobile: on-screen LEFT / LAUNCH / RIGHT buttons
   </div>
 
-  <div class="table-grid" id="tableGrid"></div>
-
-  <div class="pb-footer">
-    Also playable inside SPACED · <a href="#">midwesty.github.io/Spaced</a>
-  </div>
+  <footer>
+    Browser-native · zero build step · zero dependencies<br>
+    <a href="https://github.com/midwesty/Pinball-Buddy">github.com/midwesty/Pinball-Buddy</a>
+  </footer>
 </div>
 
 <script type="module">
-import { openPinball } from './Pinball.js';
+  import { openPinball } from './Pinball.js';
 
-const TABLES = [
-  {
-    id:'worm_holer',
-    name:'WORM HOLER',
-    sub:'Survive the Singularity',
-    icon:'🌀',
-    accent:'#4400ff',
-    bg:'linear-gradient(135deg,#110022,#000044)',
-    desc:'Black holes, quantum leaps, and gravity wells.'
-  },
-  {
-    id:'barfs_house',
-    name:"BARF'S HOUSE",
-    sub:"Based on the Hit TV Show!™",
-    icon:'🍗',
-    accent:'#ff6600',
-    bg:'linear-gradient(135deg,#221100,#440800)',
-    desc:"Serve chicken. Manage chaos. Don't get fired."
-  },
-  {
-    id:'shower_defense',
-    name:'SHOWER DEFENSE',
-    sub:'Defend Your Drain!',
-    icon:'🚿',
-    accent:'#0088ff',
-    bg:'linear-gradient(135deg,#001422,#002244)',
-    desc:'Tower defense, but wetter. Much wetter.'
-  },
-];
+  // accent colors per table for the lobby cards
+  const ACCENTS = {
+    worm_holer:    { accent:'#ff3ea5', glow:'rgba(255,62,165,.5)' },
+    barfs_house:   { accent:'#ff8a1e', glow:'rgba(255,138,30,.5)' },
+    shower_defense:{ accent:'#28e0e0', glow:'rgba(40,224,224,.5)' },
+  };
+  const DESCS = {
+    worm_holer:'Open all four worm holes, chain quantum jumps, and lock a ball for Entanglement Multiball.',
+    barfs_house:"Serve chickens at Barf's intergalactic diner. Drop-target banks, kitchen ramps, laugh-track combos.",
+    shower_defense:'Defend your shower from the spreading grime. Water drops, drain ramps, soap-scum jackpots.',
+  };
 
-const grid = document.getElementById('tableGrid');
-
-TABLES.forEach(t => {
-  const hi = JSON.parse(localStorage.getItem('pb_scores_' + t.id) || '[]');
-  const hiScore = hi.length ? hi[0].score.toLocaleString() : '---';
-
-  const card = document.createElement('div');
-  card.className = 'table-card';
-  card.style.borderColor = t.accent + '44';
-  card.innerHTML = `
-    <div class="table-icon" style="background:${t.bg};">${t.icon}</div>
-    <div class="table-info">
-      <div class="table-name" style="color:${t.accent}">${t.name}</div>
-      <div class="table-sub">${t.sub}</div>
-      <div class="table-hi">HIGH SCORE: ${hiScore} · ${t.desc}</div>
-    </div>
-    <div style="color:#555;font-size:18px">▶</div>
-  `;
-  card.addEventListener('click', () => openPinball(t.id));
-  card.addEventListener('mouseenter', () => card.style.borderColor = t.accent);
-  card.addEventListener('mouseleave', () => card.style.borderColor = t.accent+'44');
-  grid.appendChild(card);
-});
+  async function build() {
+    let tables = [];
+    try {
+      const res = await fetch('./data/pinball_tables.json');
+      const data = await res.json();
+      tables = data.tables || [];
+    } catch (e) {
+      // fallback if JSON fails to load (e.g. file:// without server)
+      tables = [
+        { id:'worm_holer', name:'WORM HOLER', subtitle:'Quantum Pinball', status:'playable' },
+        { id:'barfs_house', name:"BARF'S HOUSE", subtitle:'Intergalactic Diner', status:'placeholder' },
+        { id:'shower_defense', name:'SHOWER DEFENSE', subtitle:'Tower Defense Parody', status:'placeholder' },
+      ];
+    }
+    const grid = document.getElementById('grid');
+    grid.innerHTML = '';
+    for (const t of tables) {
+      const acc = ACCENTS[t.id] || ACCENTS.worm_holer;
+      const playable = t.status === 'playable';
+      const card = document.createElement('div');
+      card.className = 'card' + (playable ? '' : ' locked');
+      card.style.setProperty('--accent', acc.accent);
+      card.style.setProperty('--glow', acc.glow);
+      card.innerHTML = `
+        <div class="glow"></div>
+        <h2>${t.name}</h2>
+        <div class="sub">${t.subtitle || ''}</div>
+        <div class="desc">${DESCS[t.id] || ''}</div>
+        <div class="badge ${playable ? 'play' : 'soon'}">
+          ${playable ? '▶ PLAY' : 'COMING SOON'}
+        </div>`;
+      card.addEventListener('click', () => openPinball(t.id));
+      grid.appendChild(card);
+    }
+  }
+  build();
 </script>
 </body>
 </html>

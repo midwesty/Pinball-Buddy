@@ -1,1865 +1,2240 @@
-/**
- * Pinball Buddy v2 — Complete rewrite fixing all reported issues
- * ==============================================================
- * FIXED: Flipper gap (22px — ball just fits), plunger deflector,
- *        DMD always visible above canvas, dramatic bumper FX,
- *        unique table layouts with slingshots/ramps/locks/kickers
- */
+/* ============================================================================
+ * PINBALL BUDDY — Pinball.js
+ * v0.004    — full physics rebuild
+ * v0.004.1  — lane-feed arc, top-right hood redesign, flipper-gap drain fix
+ *
+ * Single-file ES module. Exports openPinball().
+ *
+ *   import { openPinball } from './Pinball.js';
+ *   openPinball('worm_holer');                      // standalone
+ *   openPinball('worm_holer', state, data, api);    // from SPACED
+ *
+ * ARCHITECTURE (read before editing)
+ * ----------------------------------
+ *  - The world is a list of COLLIDERS. Every collider is either a SEGMENT
+ *    (line, with circular end-caps so corners are smooth) or a CIRCLE
+ *    (bumpers, posts). Targets, walls, slingshots, flipper bodies — all
+ *    segments. There is exactly ONE source of truth for collision shape,
+ *    and the renderer draws THAT SAME LIST. They cannot drift apart.
+ *
+ *  - Collision is CONTINUOUS (swept). Each frame the ball's motion is
+ *    integrated in sub-steps; within a sub-step we find the earliest
+ *    time-of-impact against every collider, advance exactly to it,
+ *    reflect the velocity, and continue with the remaining time. A fast
+ *    ball physically cannot tunnel through a thin wall or target.
+ *
+ *  - Resolution is SINGLE-PASS per sub-step (earliest hit wins), which is
+ *    what kills the infinite ping-pong: the ball is never shoved by object
+ *    A into object B and back. Post-resolution a tiny separation epsilon
+ *    pushes the ball off the surface so it can't re-trigger the same hit.
+ *
+ *  - Z-AXIS. The ball has z / vz. Ramps are regions with a floor-height
+ *    function. While the ball is on a ramp it rides the ramp rails only
+ *    and ignores playfield-level colliders. The renderer scales the ball
+ *    and offsets its shadow by z, so elevation is unmistakable.
+ *
+ *  - The DMD (dot-matrix display) is independent of physics. It is the
+ *    same system as before: always-on, score / messages / mode flashes.
+ * ========================================================================== */
 
-// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+/* ==========================================================================
+ * SECTION 1 — MATH
+ * ========================================================================== */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+const rand  = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const dist2 = (ax, ay, bx, by) => { const dx = bx - ax, dy = by - ay; return dx * dx + dy * dy; };
+const dist  = (ax, ay, bx, by) => Math.sqrt(dist2(ax, ay, bx, by));
+
+// vector helpers (plain {x,y})
+const vlen  = v => Math.hypot(v.x, v.y);
+const vnorm = v => { const l = vlen(v) || 1; return { x: v.x / l, y: v.y / l }; };
+const vdot  = (a, b) => a.x * b.x + a.y * b.y;
+const vsub  = (a, b) => ({ x: a.x - b.x, y: a.y - b.y });
+const vadd  = (a, b) => ({ x: a.x + b.x, y: a.y + b.y });
+const vmul  = (a, s) => ({ x: a.x * s, y: a.y * s });
+
+// closest point on segment AB to point P -> {x,y,t}
+function closestOnSeg(px, py, ax, ay, bx, by) {
+  const abx = bx - ax, aby = by - ay;
+  const len2 = abx * abx + aby * aby || 1e-9;
+  let t = ((px - ax) * abx + (py - ay) * aby) / len2;
+  t = clamp(t, 0, 1);
+  return { x: ax + abx * t, y: ay + aby * t, t };
+}
+
+/* ==========================================================================
+ * SECTION 2 — TABLE CONSTANTS
+ * ========================================================================== */
 const PB = {
-  W:480, H:820,
-  BALL_R:11,
-  GRAVITY:0.28,
-  FRICTION:0.9988,
-  WALL_BOUNCE:0.58,
-  BUMPER_FORCE:10,
-  FLIPPER_FORCE:20,
-  PLUNGER_MAX:22,
-  MIN_SPEED:0.06,
-  FPS:60,
+  W: 540, H: 960,           // playfield canvas px
+  BALL_R: 10,               // ball radius
+  GRAVITY: 0.34,            // px/frame^2 downward
+  MAX_SPEED: 26,            // velocity clamp (prevents runaway)
+  SUBSTEPS: 6,              // collision sub-steps per frame
+  RESTITUTION: 0.36,        // generic wall bounciness
+  FRICTION: 0.992,          // per-frame velocity retention (rolling drag)
+  SEP_EPS: 0.6,             // separation pushed out after a contact
+  DMD_W: 540, DMD_H: 132,   // dot-matrix display canvas px
 };
 
-// Playfield walls
-const wallL=44, wallR=436, wallT=18;
-// ── FLIPPER GEOMETRY (canvas: y increases DOWN) ──────────────────────────────
-// LEFT flipper:  pivot=(157,748), REST angle=+0.44 (tip DOWN-right), ACTIVE=-0.44 (tip UP-right)
-// RIGHT flipper: pivot=(323,748), REST angle=PI-0.44 (tip DOWN-left), ACTIVE=PI+0.44 (tip UP-left)
-// REST tips at y≈782 (BELOW pivot), ACTIVE tips at y≈714 (ABOVE pivot)
-// Gap between tips: 21px (ball diameter 22px — ball barely passes, gutters on sides)
-const FL = {
-  leftX:157, rightX:323, y:748, len:80, w:12,
-  REST_L:   0.44,              // left flipper rest angle
-  ACT_L:   -0.44,              // left flipper active angle
-  REST_R:   Math.PI - 0.44,   // right flipper rest angle
-  ACT_R:    Math.PI + 0.44,   // right flipper active angle
-};
-// Drain y — ball drains if it passes below this (below REST tips at y≈782)
-const DRAIN_Y = 815;
-// Inlane guide walls
-const inlaneL=108, inlaneR=372;
+// playfield bounding walls (used by every table)
+const WALL = { L: 26, R: 514, T: 26, DRAIN_Y: 944 };
 
-// ─── STATE ────────────────────────────────────────────────────────────────────
-let _ov=null,_canvas=null,_dmd=null,_ctx=null,_dctx=null,_animId=null,_ac=null;
-let _state=null,_data=null,_api=null,_table=null,_tdef=null;
-const _keys={left:false,right:false,space:false};
-let _pb={};
+export const PB_VERSION = 'v0.004.1';
 
-function freshPB(id){
+/* ==========================================================================
+ * SECTION 3 — COLLIDER PRIMITIVES
+ * --------------------------------------------------------------------------
+ * Colliders are plain data. Physics consumes them; the renderer draws them.
+ * kind: 'seg'  -> a,b endpoints, r = edge thickness radius
+ *       'circle' -> c center, r radius
+ * Shared optional fields:
+ *   bounce   : restitution override (else PB.RESTITUTION)
+ *   role     : 'wall' | 'target' | 'bumper' | 'sling' | 'flipper' | 'post' | 'ramp'
+ *   ref      : back-pointer to the game object (target/bumper) for scoring
+ *   active   : if false the collider is skipped this frame (used by gates)
+ * ========================================================================== */
+function seg(ax, ay, bx, by, opt = {}) {
   return {
-    tableId:id,
-    ball:{x:PB.W-28,y:PB.H-150,vx:0,vy:0,z:0,vz:0,active:false,lost:false},
-    extras:[],
-    flippers:[], bumpers:[], targets:[], slings:[], ramps:[],
-    lights:[], wormHoles:[], dropBanks:[], locks:[], kickers:[],
-    score:0, ballsLeft:3, ballNum:1, multiplier:1,
-    combo:0, comboTimer:0,
-    plungerCharge:0, launched:false,
-    phase:'attract', phaseTimer:0,
-    modeActive:null, modeTimer:0, modeData:{},
-    dmdMsg:'', dmdFlash:0, dmdSub:'',
-    tableProgress:{},
-    highScores:[],
-    lastMatch:null,
-    pulses:[],       // visual hit pulses
-    strobes:[],      // strobe light effects
-    arrows:[],       // lit directional arrows on table
+    kind: 'seg', a: { x: ax, y: ay }, b: { x: bx, y: by },
+    r: opt.r ?? 2, bounce: opt.bounce ?? PB.RESTITUTION,
+    role: opt.role ?? 'wall', ref: opt.ref ?? null, active: opt.active ?? true,
+    color: opt.color ?? null,
+  };
+}
+function circle(cx, cy, r, opt = {}) {
+  return {
+    kind: 'circle', c: { x: cx, y: cy }, r,
+    bounce: opt.bounce ?? PB.RESTITUTION,
+    role: opt.role ?? 'wall', ref: opt.ref ?? null, active: opt.active ?? true,
+    color: opt.color ?? null,
   };
 }
 
-// ─── ENTRY ────────────────────────────────────────────────────────────────────
-export function openPinball(tableId,state,data,api){
-  _state=state||null; _data=data||null; _api=api||null;
-  const tables=(_data?.pinball?.tables)||defaultTables();
-  _tdef=tables.find(t=>t.id===tableId)||tables[0];
-  injectStyles();
-  if(_ov){_ov.remove();cancelAnimationFrame(_animId);cleanup();}
-  _ov=document.createElement('div');
-  _ov.id='pbOv'; _ov.className='pb-ov';
-  document.body.appendChild(_ov);
-  buildUI();
-  _pb=freshPB(tableId);
-  _table=buildTable(tableId);
-  applyTableToPB();
-  _pb.highScores=JSON.parse(localStorage.getItem('pb_hi_'+tableId)||'[]');
-  initAudio(); bindKeys();
-  _pb.phase='attract';
-  loop();
+/* ==========================================================================
+ * SECTION 4 — SWEPT COLLISION
+ * --------------------------------------------------------------------------
+ * sweepCircleVsCollider(p0, vel, R, col)
+ *   p0  : ball center at start of sub-step {x,y}
+ *   vel : displacement vector for this sub-step {x,y}
+ *   R   : ball radius
+ *   col : collider
+ *   -> null, or { t, nx, ny, point } where
+ *        t      = fraction [0,1] of vel at which contact occurs
+ *        nx,ny  = unit surface normal pointing AT the ball
+ *        point  = world contact point on the collider surface
+ *
+ * SEGMENT case: a moving circle vs a segment-with-radius is equivalent to a
+ * moving point vs a capsule of radius (R + col.r). We test the swept point
+ * against the capsule: the two end discs and the slab between them.
+ * CIRCLE case: classic moving-circle vs static-circle quadratic.
+ * ========================================================================== */
+function sweepVsCircle(p0, vel, R, cx, cy, cr) {
+  // moving point p0 + vel*t vs static circle radius (R+cr)
+  const rad = R + cr;
+  const ox = p0.x - cx, oy = p0.y - cy;
+  const a = vel.x * vel.x + vel.y * vel.y;
+  if (a < 1e-12) {
+    // not moving — handle as static overlap (resolved elsewhere)
+    return null;
+  }
+  const b = 2 * (ox * vel.x + oy * vel.y);
+  const c = ox * ox + oy * oy - rad * rad;
+  const disc = b * b - 4 * a * c;
+  if (disc < 0) return null;
+  const sq = Math.sqrt(disc);
+  let t = (-b - sq) / (2 * a);
+  if (t < 0) t = (-b + sq) / (2 * a); // started inside; take exit-ish root
+  if (t < -0.001 || t > 1) return null;
+  t = clamp(t, 0, 1);
+  const hx = p0.x + vel.x * t, hy = p0.y + vel.y * t;
+  let nx = hx - cx, ny = hy - cy;
+  const nl = Math.hypot(nx, ny) || 1;
+  nx /= nl; ny /= nl;
+  return { t, nx, ny, point: { x: cx + nx * cr, y: cy + ny * cr } };
 }
 
-function defaultTables(){
-  return [
-    {id:'worm_holer',   name:'WORM HOLER',    subtitle:'Survive the Singularity', ballColor:'#c0e0ff',accentColor:'#4400ff',secondColor:'#ff00cc',bgColor:'#000008'},
-    {id:'barfs_house',  name:"BARF'S HOUSE",  subtitle:'Based on the Hit TV Show!',ballColor:'#ffdd44',accentColor:'#ff6600',secondColor:'#00cc44',bgColor:'#1a0800'},
-    {id:'shower_defense',name:'SHOWER DEFENSE',subtitle:'Defend Your Drain!',      ballColor:'#aaddff',accentColor:'#0088ff',secondColor:'#00ffcc',bgColor:'#001820'},
+function sweepCircleVsCollider(p0, vel, R, col) {
+  if (!col.active) return null;
+  if (col.kind === 'circle') {
+    return sweepVsCircle(p0, vel, R, col.c.x, col.c.y, col.r);
+  }
+  // SEGMENT capsule: radius = R + col.r
+  const rad = R + col.r;
+  const ax = col.a.x, ay = col.a.y, bx = col.b.x, by = col.b.y;
+  const abx = bx - ax, aby = by - ay;
+  const abLen2 = abx * abx + aby * aby || 1e-9;
+
+  // 1) infinite-line slab test: does the swept point cross within rad of line?
+  // perpendicular unit
+  const segLen = Math.sqrt(abLen2);
+  let nx = -aby / segLen, ny = abx / segLen;
+  // make normal point toward ball start
+  const side = (p0.x - ax) * nx + (p0.y - ay) * ny;
+  if (side < 0) { nx = -nx; ny = -ny; }
+  const sd0 = (p0.x - ax) * nx + (p0.y - ay) * ny;          // signed dist now
+  const vn  = vel.x * nx + vel.y * ny;                       // normal speed
+  let tLine = null;
+  if (sd0 >= 0) {
+    if (vn < -1e-9) {
+      const tt = (sd0 - rad) / -vn;
+      if (tt <= 1) tLine = Math.max(0, tt);
+    } else if (sd0 <= rad) {
+      tLine = 0; // already within slab, moving along/away — treat as touching
+    }
+  }
+  let best = null;
+  if (tLine !== null) {
+    const hx = p0.x + vel.x * tLine, hy = p0.y + vel.y * tLine;
+    // projection onto segment
+    let proj = ((hx - ax) * abx + (hy - ay) * aby) / abLen2;
+    if (proj >= 0 && proj <= 1) {
+      const cpx = ax + abx * proj, cpy = ay + aby * proj;
+      best = { t: tLine, nx, ny, point: { x: cpx, y: cpy } };
+    }
+  }
+  // 2) end-cap discs (handles corners + the segment ends)
+  const capA = sweepVsCircle(p0, vel, R, ax, ay, col.r);
+  const capB = sweepVsCircle(p0, vel, R, bx, by, col.r);
+  for (const cap of [capA, capB]) {
+    if (cap && (!best || cap.t < best.t)) best = cap;
+  }
+  return best;
+}
+
+/* static depenetration: if ball is already overlapping a collider, push out.
+ * returns {nx,ny,depth} or null. Used as a safety net so the ball never
+ * settles inside geometry (which would otherwise cause sticking). */
+function staticPush(p, R, col) {
+  if (!col.active) return null;
+  if (col.kind === 'circle') {
+    const d = dist(p.x, p.y, col.c.x, col.c.y);
+    const rad = R + col.r;
+    if (d < rad - 0.01) {
+      let nx = (p.x - col.c.x), ny = (p.y - col.c.y);
+      const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+      return { nx, ny, depth: rad - d };
+    }
+    return null;
+  }
+  const cp = closestOnSeg(p.x, p.y, col.a.x, col.a.y, col.b.x, col.b.y);
+  const d = dist(p.x, p.y, cp.x, cp.y);
+  const rad = R + col.r;
+  if (d < rad - 0.01) {
+    let nx = p.x - cp.x, ny = p.y - cp.y;
+    const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+    return { nx, ny, depth: rad - d };
+  }
+  return null;
+}
+
+/* ==========================================================================
+ * SECTION 5 — MODULE STATE
+ * ========================================================================== */
+const _keys = { left: false, right: false, space: false };
+let _ov = null;            // overlay root
+let _raf = 0;              // requestAnimationFrame id
+let _ac = null;            // AudioContext
+let _running = false;
+let _table = null;         // active built table (geometry + logic)
+let _tdef = null;          // table metadata from JSON
+let _pb = {};              // mutable game state (freshPB)
+let _spaced = null;        // { state, data, api } when launched from SPACED
+let _pfCanvas = null, _pfCtx = null;
+let _dmdCanvas = null, _dmdCtx = null;
+let _lastT = 0;
+
+function freshPB() {
+  return {
+    phase: 'attract',      // attract | plunge | play | balllost | gameover
+    score: 0,
+    ball: 1,
+    ballsTotal: 3,
+    mult: 1,
+    combo: 0,
+    comboTimer: 0,
+    balls: [],             // live Ball objects (multiball)
+    plungeCharge: 0,       // 0..1
+    plungePower: 0,        // captured on release
+    flipper: { lU: 0, lA: 0, rU: 0, rA: 0 }, // current/target angles per flipper group
+    dmd: { mode: 'attract', msg: '', sub: '', timer: 0, t: 0 },
+    modeName: '',
+    modeTimer: 0,
+    tick: 0,
+    shake: 0,
+    started: false,
+    highScore: 0,
+  };
+}
+
+/* a single ball */
+function Ball(x, y) {
+  return {
+    x, y, vx: 0, vy: 0,
+    z: 0, vz: 0,          // elevation
+    r: PB.BALL_R,
+    onRamp: null,         // ramp object the ball is currently riding, or null
+    rampT: 0,             // 0..1 progress along current ramp
+    dead: false,
+    inLane: true,         // sitting in the plunger lane
+    laneFeed: false,      // running the scripted lane-mouth feed arc
+    feedT: 0,             // progress along the feed arc (0..1)
+    feedSpeed: 9,         // speed carried through the feed arc
+    stuckTimer: 0,        // anti-stuck watchdog
+    lastSpeed: 0,
+    trail: [],
+  };
+}
+
+/* ==========================================================================
+ * SECTION 6 — AUDIO (synth, no asset files)
+ * ========================================================================== */
+function initAudio() {
+  try { _ac = new (window.AudioContext || window.webkitAudioContext)(); }
+  catch (e) { _ac = null; }
+}
+function resumeAudio() { if (_ac && _ac.state === 'suspended') _ac.resume(); }
+
+function tone(freq, dur, type = 'sine', vol = 0.18, slideTo = null) {
+  if (!_ac) return;
+  const o = _ac.createOscillator();
+  const g = _ac.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, _ac.currentTime);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(40, slideTo), _ac.currentTime + dur);
+  g.gain.setValueAtTime(vol, _ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, _ac.currentTime + dur);
+  o.connect(g); g.connect(_ac.destination);
+  o.start(); o.stop(_ac.currentTime + dur + 0.02);
+}
+function noise(dur, vol = 0.15, freq = 1200) {
+  if (!_ac) return;
+  const n = Math.floor(_ac.sampleRate * dur);
+  const buf = _ac.createBuffer(1, n, _ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const s = _ac.createBufferSource(); s.buffer = buf;
+  const f = _ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq;
+  const g = _ac.createGain(); g.gain.value = vol;
+  g.gain.exponentialRampToValueAtTime(0.0001, _ac.currentTime + dur);
+  s.connect(f); f.connect(g); g.connect(_ac.destination);
+  s.start(); s.stop(_ac.currentTime + dur + 0.02);
+}
+function snd(name) {
+  switch (name) {
+    case 'flipper':  tone(180, 0.06, 'square', 0.10); break;
+    case 'bumper':   tone(440, 0.10, 'triangle', 0.18, 700); break;
+    case 'sling':    tone(330, 0.08, 'sawtooth', 0.14, 520); break;
+    case 'target':   tone(660, 0.07, 'square', 0.12, 880); break;
+    case 'wall':     tone(150, 0.04, 'sine', 0.06); break;
+    case 'ramp':     tone(520, 0.18, 'sine', 0.12, 900); break;
+    case 'rampDown': tone(700, 0.16, 'sine', 0.10, 380); break;
+    case 'drain':    tone(200, 0.5, 'sawtooth', 0.16, 60); break;
+    case 'launch':   tone(120, 0.3, 'sawtooth', 0.18, 420); break;
+    case 'group':    [523,659,784,1046].forEach((f,i)=>setTimeout(()=>tone(f,0.16,'square',0.14),i*70)); break;
+    case 'wormhole': tone(880, 0.4, 'sine', 0.16, 110); noise(0.4, 0.10, 600); break;
+    case 'wormActivate': [220,330,440,660].forEach((f,i)=>setTimeout(()=>tone(f,0.2,'triangle',0.14),i*60)); break;
+    case 'multiball':[392,523,659,784,1046].forEach((f,i)=>setTimeout(()=>tone(f,0.22,'square',0.16),i*90)); break;
+    case 'mode':     [330,440,550].forEach((f,i)=>setTimeout(()=>tone(f,0.25,'triangle',0.16),i*100)); break;
+    case 'lock':     tone(294, 0.2, 'sine', 0.14, 180); break;
+    case 'gameover': [440,392,349,294,247].forEach((f,i)=>setTimeout(()=>tone(f,0.4,'sawtooth',0.16),i*220)); break;
+    default: break;
+  }
+}
+
+/* ==========================================================================
+ * SECTION 7 — DMD (dot-matrix display)
+ * --------------------------------------------------------------------------
+ * Unchanged in spirit from prior versions: a virtual low-res dot grid drawn
+ * onto a real canvas. Always visible. dmd(msg,sub) flashes a message.
+ * Future: per-table animated attract sequences plug into drawDMD().
+ * ========================================================================== */
+const DMD = { cols: 108, rows: 26, dot: 5 }; // virtual grid
+
+function dmdFlash(msg, sub = '') {
+  _pb.dmd.msg = msg; _pb.dmd.sub = sub;
+  _pb.dmd.timer = 150;  // ~2.5s at 60fps
+}
+
+// tiny 5x7-ish pixel font (uppercase, digits, basic punctuation)
+const GLYPHS = (() => {
+  // each glyph is 5 wide x 7 tall, rows top->bottom, bits left->right
+  const F = {
+    'A':['01110','10001','10001','11111','10001','10001','10001'],
+    'B':['11110','10001','11110','10001','10001','10001','11110'],
+    'C':['01110','10001','10000','10000','10000','10001','01110'],
+    'D':['11110','10001','10001','10001','10001','10001','11110'],
+    'E':['11111','10000','11110','10000','10000','10000','11111'],
+    'F':['11111','10000','11110','10000','10000','10000','10000'],
+    'G':['01110','10001','10000','10111','10001','10001','01111'],
+    'H':['10001','10001','10001','11111','10001','10001','10001'],
+    'I':['11111','00100','00100','00100','00100','00100','11111'],
+    'J':['00111','00010','00010','00010','10010','10010','01100'],
+    'K':['10001','10010','10100','11000','10100','10010','10001'],
+    'L':['10000','10000','10000','10000','10000','10000','11111'],
+    'M':['10001','11011','10101','10101','10001','10001','10001'],
+    'N':['10001','11001','10101','10011','10001','10001','10001'],
+    'O':['01110','10001','10001','10001','10001','10001','01110'],
+    'P':['11110','10001','10001','11110','10000','10000','10000'],
+    'Q':['01110','10001','10001','10001','10101','10010','01101'],
+    'R':['11110','10001','10001','11110','10100','10010','10001'],
+    'S':['01111','10000','10000','01110','00001','00001','11110'],
+    'T':['11111','00100','00100','00100','00100','00100','00100'],
+    'U':['10001','10001','10001','10001','10001','10001','01110'],
+    'V':['10001','10001','10001','10001','10001','01010','00100'],
+    'W':['10001','10001','10001','10101','10101','11011','10001'],
+    'X':['10001','10001','01010','00100','01010','10001','10001'],
+    'Y':['10001','10001','01010','00100','00100','00100','00100'],
+    'Z':['11111','00010','00100','01000','10000','10000','11111'],
+    '0':['01110','10011','10101','10101','11001','10001','01110'],
+    '1':['00100','01100','00100','00100','00100','00100','01110'],
+    '2':['01110','10001','00001','00110','01000','10000','11111'],
+    '3':['11110','00001','00001','01110','00001','00001','11110'],
+    '4':['00010','00110','01010','10010','11111','00010','00010'],
+    '5':['11111','10000','11110','00001','00001','10001','01110'],
+    '6':['00110','01000','10000','11110','10001','10001','01110'],
+    '7':['11111','00001','00010','00100','01000','01000','01000'],
+    '8':['01110','10001','10001','01110','10001','10001','01110'],
+    '9':['01110','10001','10001','01111','00001','00010','01100'],
+    ' ':['00000','00000','00000','00000','00000','00000','00000'],
+    '.':['00000','00000','00000','00000','00000','01100','01100'],
+    ',':['00000','00000','00000','00000','00000','00110','01100'],
+    '!':['00100','00100','00100','00100','00100','00000','00100'],
+    '?':['01110','10001','00010','00100','00100','00000','00100'],
+    ':':['00000','01100','01100','00000','01100','01100','00000'],
+    '-':['00000','00000','00000','11111','00000','00000','00000'],
+    "'":['00100','00100','00100','00000','00000','00000','00000'],
+    '+':['00000','00100','00100','11111','00100','00100','00000'],
+    'x':['00000','00000','10001','01010','00100','01010','10001'],
+    '/':['00001','00010','00100','00100','01000','10000','10000'],
+  };
+  return F;
+})();
+
+function dmdText(grid, str, x, y, on = 1) {
+  str = String(str).toUpperCase();
+  let cx = x;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS['?'];
+    for (let r = 0; r < 7; r++) {
+      for (let c = 0; c < 5; c++) {
+        if (g[r][c] === '1') {
+          const gx = cx + c, gy = y + r;
+          if (gx >= 0 && gx < DMD.cols && gy >= 0 && gy < DMD.rows) grid[gy][gx] = on;
+        }
+      }
+    }
+    cx += 6;
+  }
+  return cx;
+}
+function dmdTextCentered(grid, str, y, on = 1) {
+  const w = String(str).length * 6 - 1;
+  dmdText(grid, str, Math.floor((DMD.cols - w) / 2), y, on);
+}
+
+/* ==========================================================================
+ * (engine continues in part 2 — geometry builders, table, physics step,
+ *  render, UI — appended below)
+ * ========================================================================== */
+
+/* ==========================================================================
+ * SECTION 8 — FLIPPER MODEL
+ * --------------------------------------------------------------------------
+ * A flipper is a fat segment that rotates about a pivot between a rest angle
+ * and an active angle. Its collider is rebuilt every frame from the current
+ * angle, so the thing you SEE is the thing you HIT.
+ *
+ * Canvas y increases DOWNWARD. We store angles in standard math convention
+ * and just accept that. restAngle/activeAngle are absolute angles of the
+ * flipper's pointing direction (pivot -> tip). The flipper sweeps between
+ * them; angular velocity is tracked so a moving flipper imparts momentum to
+ * the ball (a real flipper "shot" — not just a static bounce).
+ * ========================================================================== */
+function makeFlipper(opt) {
+  return {
+    side: opt.side,                 // 'L' | 'R'
+    group: opt.group ?? 'main',     // flippers in the same group share a key
+    px: opt.px, py: opt.py,         // pivot
+    len: opt.len ?? 78,
+    r: opt.r ?? 9,                  // flipper thickness radius
+    rest: opt.rest,                 // absolute rest angle (radians)
+    active: opt.active,             // absolute active angle (radians)
+    angle: opt.rest,                // current angle
+    av: 0,                          // angular velocity (rad/frame)
+    up: false,                      // commanded up?
+    speed: opt.speed ?? 0.62,       // how fast it swings (rad/frame)
+  };
+}
+function flipperTip(fl) {
+  return { x: fl.px + Math.cos(fl.angle) * fl.len,
+           y: fl.py + Math.sin(fl.angle) * fl.len };
+}
+function flipperCollider(fl) {
+  const tip = flipperTip(fl);
+  return seg(fl.px, fl.py, tip.x, tip.y, { r: fl.r, role: 'flipper', bounce: 0.5, ref: fl });
+}
+function updateFlipper(fl) {
+  const target = fl.up ? fl.active : fl.rest;
+  const prev = fl.angle;
+  // move toward target, capped by swing speed
+  const diff = target - fl.angle;
+  const step = clamp(diff, -fl.speed, fl.speed);
+  fl.angle += step;
+  fl.av = fl.angle - prev;       // angular velocity this frame
+}
+
+/* ==========================================================================
+ * SECTION 9 — RAMP MODEL (the Z axis)
+ * --------------------------------------------------------------------------
+ * A ramp is a CENTERLINE PATH (list of points) with a width, plus a height
+ * profile h0..h1 (z at entry .. z at exit). Two rail colliders run down each
+ * side of the path so the ball is physically funneled.
+ *
+ * When the ball's center is within the ramp's mouth zone AND moving fast
+ * enough INTO the ramp, it "mounts": ball.onRamp is set, the ball follows
+ * the centerline, its z is interpolated from rampT, and it ignores
+ * playfield-level colliders. At rampT>=1 it ejects at the exit with the
+ * exit direction + a speed boost; at rampT<=0 (rolled back) it dismounts at
+ * the entry. The renderer scales the ball by z and offsets the shadow, so
+ * "this ball is up on a ramp" is visually obvious.
+ * ========================================================================== */
+function makeRamp(opt) {
+  // opt.path: [{x,y}...] centerline from entry to exit
+  // opt.width, opt.h0, opt.h1, opt.exitBoost, opt.id, opt.color
+  const path = opt.path;
+  // cumulative length for arc-length parametrization
+  const segLens = [];
+  let total = 0;
+  for (let i = 1; i < path.length; i++) {
+    const d = dist(path[i-1].x, path[i-1].y, path[i].x, path[i].y);
+    segLens.push(d); total += d;
+  }
+  return {
+    id: opt.id, path, segLens, total,
+    width: opt.width ?? 30,
+    h0: opt.h0 ?? 0, h1: opt.h1 ?? 60,
+    exitBoost: opt.exitBoost ?? 9,
+    mountSpeed: opt.mountSpeed ?? 6,   // min speed into mouth to mount
+    color: opt.color ?? '#39d7ff',
+    onEject: opt.onEject ?? null,
+  };
+}
+// point + tangent at arc fraction t (0..1)
+function rampPoint(ramp, t) {
+  t = clamp(t, 0, 1);
+  let target = t * ramp.total, acc = 0;
+  for (let i = 0; i < ramp.segLens.length; i++) {
+    if (acc + ramp.segLens[i] >= target || i === ramp.segLens.length - 1) {
+      const local = ramp.segLens[i] < 1e-6 ? 0 : (target - acc) / ramp.segLens[i];
+      const p0 = ramp.path[i], p1 = ramp.path[i+1];
+      const x = lerp(p0.x, p1.x, local), y = lerp(p0.y, p1.y, local);
+      let tx = p1.x - p0.x, ty = p1.y - p0.y;
+      const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+      return { x, y, tx, ty };
+    }
+    acc += ramp.segLens[i];
+  }
+  const p = ramp.path[ramp.path.length - 1];
+  return { x: p.x, y: p.y, tx: 0, ty: -1 };
+}
+function rampHeight(ramp, t) { return lerp(ramp.h0, ramp.h1, clamp(t, 0, 1)); }
+
+/* ==========================================================================
+ * SECTION 10 — TABLE: WORM HOLER
+ * --------------------------------------------------------------------------
+ * A genuine pinball layout. Coordinates chosen for a 540x960 playfield.
+ *
+ * Lower third  : two main flippers in a proper triangle, slingshots above
+ *                them, inlane/outlane guides, return lanes.
+ * Mid third    : pop-bumper cluster (fan-spaced 92px apart), drop-target
+ *                bank "WORM", a mid-table flipper pair (kickers).
+ * Upper third  : drop-target bank "HOLE", two orbit lanes, ramp habitrails.
+ * Worm holes   : 4 circular sink-holes; activate sequentially; an active
+ *                hole exerts a gentle gravity pull and teleports the ball
+ *                to a random other active hole.
+ *
+ * Everything pushes into ONE colliders[] array each frame (rebuilt because
+ * flippers move). Static geometry is cached and flipper/dynamic colliders
+ * are appended.
+ * ========================================================================== */
+function buildWormHoler(tdef) {
+  const T = {
+    id: 'worm_holer',
+    name: tdef?.name || 'WORM HOLER',
+    colors: tdef?.colors || { bg:'#0a0a1f', mid:'#1a1145', neon:'#ff3ea5',
+                              neon2:'#39d7ff', wall:'#5b4b9e' },
+    staticColliders: [],
+    flippers: [],
+    bumpers: [],
+    targets: [],
+    ramps: [],
+    wormholes: [],
+    posts: [],
+    lanes: [],          // rollover lanes (top)
+    spinners: [],
+    lockZone: null,
+    // logic state
+    wormProgress: 0,    // letters of WORM hit
+    holeProgress: 0,    // letters of HOLE hit
+    activeHoles: 0,
+    locked: 0,
+    multiballArmed: false,
+  };
+
+  /* ---- outer walls (the boundary of play) ---- */
+  const W = WALL;
+  // left & right walls, angled top corners, leaving a plunger lane on the right
+  const laneX = PB.W - 46;          // plunger lane centre
+  const laneWallL = PB.W - 70;      // inner wall of plunger lane
+  // The plunger lane occupies the right edge. Its INNER wall runs from the
+  // table floor up to laneTop; above laneTop the lane OPENS so the ball can
+  // arc left into the playfield. A curved deflector along the top-right
+  // sweeps the ball leftward.
+  const laneTop = 210;          // y where the lane opens into the field
+  // TOP-RIGHT DESIGN (classic feed): the plunger lane is a sealed channel
+  // from the floor up to the lane mouth at laneTop. At the mouth the inner
+  // wall ENDS and a short angled "kicker lip" juts in from the right wall,
+  // so a ball rising out of the lane is deflected LEFT into the field. The
+  // continuous hood above prevents the ball escaping over the top-right.
+  // main field outer walls
+  T.staticColliders.push(
+    seg(W.L, W.T+60, W.L, 720, { r:4, role:'wall', color:T.colors.wall }),       // left wall
+    seg(W.L, W.T+60, 150, W.T, { r:4, role:'wall', color:T.colors.wall }),       // top-left diagonal
+    seg(150, W.T, 360, W.T, { r:4, role:'wall', color:T.colors.wall }),          // top wall
+    // ---- deflector hood (continuous, sweeps the ball left, no flat shelf) ----
+    seg(360, W.T, 440, 46, { r:5, role:'wall', color:T.colors.wall }),           // hood: top wall -> right shoulder
+    seg(440, 46, 488, 120, { r:5, role:'wall', color:T.colors.wall }),           // hood: shoulder -> outer crest
+    seg(488, 120, 470, 196, { r:5, role:'wall', color:T.colors.wall }),          // hood: crest curving back inward to mouth
+    // hood underside: a long DOWN-LEFT ramp that carries the ball into play
+    seg(470, 196, 372, 250, { r:5, role:'wall', color:T.colors.wall }),
+    // inner plunger-lane wall: floor up to the lane mouth ONLY
+    seg(laneWallL, laneTop, laneWallL, 900, { r:4, role:'wall', color:T.colors.wall }),
+    // kicker lip at the mouth: short angled stub from the right wall that
+    // noses the rising ball left so it always clears onto the hood underside
+    seg(W.R, laneTop-4, laneWallL+6, laneTop-30, { r:4, role:'wall', color:T.colors.wall }),
+    seg(W.R, W.T+30, W.R, 900, { r:4, role:'wall', color:T.colors.wall }),       // far right wall
+  );
+
+  /* ---- plunger lane ---- */
+  T.plunger = {
+    x: laneX, top: laneTop, bottom: 900,
+    laneL: laneWallL, laneR: W.R,
+    headY: 880, headRest: 880, headDeep: 920,
+  };
+  // one-way gate sealing the lane channel at the mouth. Blocks a ball
+  // FALLING back into the lane; never blocks a ball leaving. Angled so a
+  // ball can never balance on top of it.
+  T.laneGate = seg(laneWallL, laneTop+8, W.R, laneTop-8, { r:3, role:'gate', active:false });
+
+  /* ---- lower flippers (proper triangle) ----
+   * Pivots 150px apart, tips ~ 1 ball-width apart, raked ~28deg.
+   * Rest: tip angled DOWN-and-out. Active: swung UP-and-in. */
+  const flY = 812;
+  const restRake = 0.50;       // radians below horizontal at rest
+  const swing    = 0.95;       // total swing
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'main', px:176, py:flY, len:84,
+      rest:  restRake,                 // points down-right
+      active: restRake - swing }),     // swings up
+    makeFlipper({ side:'R', group:'main', px:364, py:flY, len:84,
+      rest:  Math.PI - restRake,       // points down-left
+      active: Math.PI - restRake + swing }),
+  );
+
+  /* ---- slingshots (the angled bumpers above each flipper) ---- */
+  // left sling
+  T.staticColliders.push(
+    seg(96, 690, 150, 790, { r:7, role:'sling', bounce:1.05, color:T.colors.neon }),
+  );
+  // right sling
+  T.staticColliders.push(
+    seg(444, 690, 390, 790, { r:7, role:'sling', bounce:1.05, color:T.colors.neon }),
+  );
+  // inlane / outlane guide rails
+  T.staticColliders.push(
+    seg(96, 690, 96, 760, { r:4, role:'wall', color:T.colors.wall }),     // left outer guide
+    seg(150, 790, 176, 812, { r:4, role:'wall', color:T.colors.wall }),   // left inlane to flipper
+    seg(444, 690, 444, 760, { r:4, role:'wall', color:T.colors.wall }),   // right outer guide
+    seg(390, 790, 364, 812, { r:4, role:'wall', color:T.colors.wall }),   // right inlane to flipper
+    // outlane drain channels (narrow — punishing, like real tables)
+    seg(W.L, 720, 70, 820, { r:4, role:'wall', color:T.colors.wall }),
+    seg(W.R, 760, 470, 850, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // slingshot kicker posts (small circles at sling ends so ball doesn't snag)
+  T.posts.push(
+    circle(96, 690, 8, { role:'post', color:T.colors.wall }),
+    circle(444, 690, 8, { role:'post', color:T.colors.wall }),
+  );
+
+  /* ---- pop bumpers (fan cluster, mid-table, 96px+ apart) ---- */
+  const bumperDefs = [
+    { x: 200, y: 392, r: 26 },
+    { x: 320, y: 392, r: 26 },
+    { x: 260, y: 300, r: 26 },
   ];
+  for (const bd of bumperDefs) {
+    const b = { x: bd.x, y: bd.y, r: bd.r, cooldown: 0, flash: 0, value: 250 };
+    T.bumpers.push(b);
+  }
+
+  /* ---- drop-target bank: WORM (4 targets, left mid) ---- */
+  const wormBank = makeTargetBank({
+    word: 'WORM', x: 78, y: 470, dx: 0, dy: 40, w: 30, h: 30,
+    vertical: true, group: 'worm', value: 500,
+  });
+  T.targets.push(...wormBank);
+
+  /* ---- drop-target bank: HOLE (4 targets, upper centre) ---- */
+  const holeBank = makeTargetBank({
+    word: 'HOLE', x: 196, y: 150, dx: 40, dy: 0, w: 30, h: 30,
+    vertical: false, group: 'hole', value: 500,
+  });
+  T.targets.push(...holeBank);
+
+  /* ---- worm holes (4 sink-holes) ---- */
+  const holeSpots = [
+    { x: 120, y: 250 }, { x: 420, y: 250 },
+    { x: 130, y: 560 }, { x: 410, y: 560 },
+  ];
+  holeSpots.forEach((s, i) => {
+    T.wormholes.push({
+      x: s.x, y: s.y, r: 22, active: false, idx: i,
+      pull: 0.10, swirl: 0,
+    });
+  });
+
+  /* ---- mid-table mini flippers (kickers near the bumper cluster) ---- */
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'mid', px:150, py:540, len:54, r:8,
+      rest: 0.45, active: 0.45 - 0.85, speed: 0.7 }),
+    makeFlipper({ side:'R', group:'mid', px:390, py:540, len:54, r:8,
+      rest: Math.PI - 0.45, active: Math.PI - 0.45 + 0.85, speed: 0.7 }),
+  );
+
+  /* ---- ramps (real Z-axis habitrails) ---- */
+  // LEFT ORBIT RAMP: enters near left sling area, climbs, loops over the top,
+  // ejects down the right inlane.
+  T.ramps.push(makeRamp({
+    id: 'left_orbit',
+    path: [
+      { x: 110, y: 640 }, { x: 86, y: 520 }, { x: 96, y: 360 },
+      { x: 150, y: 200 }, { x: 270, y: 120 }, { x: 392, y: 150 },
+      { x: 430, y: 300 }, { x: 430, y: 470 }, { x: 420, y: 640 },
+    ],
+    width: 30, h0: 0, h1: 70, exitBoost: 7, mountSpeed: 7,
+    color: T.colors.neon2,
+  }));
+  // CENTER LOOP RAMP: short ramp up the middle that re-feeds the bumpers.
+  T.ramps.push(makeRamp({
+    id: 'center_loop',
+    path: [
+      { x: 260, y: 540 }, { x: 260, y: 460 }, { x: 230, y: 420 },
+      { x: 260, y: 360 }, { x: 300, y: 340 },
+    ],
+    width: 28, h0: 0, h1: 48, exitBoost: 6, mountSpeed: 6.5,
+    color: T.colors.neon,
+  }));
+
+  /* ---- ball lock (center sink, triggers multiball) ---- */
+  T.lockZone = { x: 260, y: 220, r: 20, active: true };
+
+  /* ---- top rollover lanes (skill-shot style) ---- */
+  T.lanes.push(
+    { x: 175, y: 86, lit: false }, { x: 270, y: 78, lit: false }, { x: 365, y: 86, lit: false },
+  );
+
+  return T;
 }
 
-function applyTableToPB(){
-  _pb.flippers  =_table.flippers;
-  _pb.bumpers   =_table.bumpers;
-  _pb.targets   =_table.targets;
-  _pb.slings    =_table.slings;
-  _pb.ramps     =_table.ramps;
-  _pb.lights    =_table.lights;
-  _pb.wormHoles =_table.wormHoles||[];
-  _pb.dropBanks =_table.dropBanks||[];
-  _pb.locks     =_table.locks||[];
-  _pb.kickers   =_table.kickers||[];
-  _pb.arrows    =_table.arrows||[];
+/* build a bank of drop targets spelling a word */
+function makeTargetBank(opt) {
+  const arr = [];
+  for (let i = 0; i < opt.word.length; i++) {
+    arr.push({
+      letter: opt.word[i],
+      group: opt.group,
+      x: opt.x + opt.dx * i,
+      y: opt.y + opt.dy * i,
+      w: opt.w, h: opt.h,
+      vertical: opt.vertical,
+      hit: false,
+      flash: 0,
+      value: opt.value,
+      idx: i,
+    });
+  }
+  return arr;
 }
 
-// ─── UI ───────────────────────────────────────────────────────────────────────
-function buildUI(){
-  // Define globals FIRST so onclick attrs work immediately
-  window.pbK=(k,v)=>{_keys[k]=!!v;};
-  window.pbClose=pbClose;
 
-  _ov.innerHTML=`
-  <div class="pb-shell">
-    <div class="pb-dmd-bar">
-      <canvas id="pbDMD" width="480" height="96"></canvas>
-    </div>
-    <div class="pb-field">
-      <canvas id="pbCanvas" width="${PB.W}" height="${PB.H}"></canvas>
-    </div>
-    <div class="pb-btns">
-      <button class="pb-btn pb-l"
-        onmousedown="pbK('left',1)" onmouseup="pbK('left',0)"
-        ontouchstart="pbK('left',1)" ontouchend="pbK('left',0)" ontouchcancel="pbK('left',0)">◀ LEFT</button>
-      <button class="pb-btn pb-m"
-        onmousedown="pbK('space',1)" onmouseup="pbK('space',0)"
-        ontouchstart="pbK('space',1)" ontouchend="pbK('space',0)" ontouchcancel="pbK('space',0)">LAUNCH</button>
-      <button class="pb-btn pb-r"
-        onmousedown="pbK('right',1)" onmouseup="pbK('right',0)"
-        ontouchstart="pbK('right',1)" ontouchend="pbK('right',0)" ontouchcancel="pbK('right',0)">RIGHT ▶</button>
-    </div>
-  </div>
-  <button class="pb-x" onclick="pbClose()">✕</button>`;
-
-  _canvas=document.getElementById('pbCanvas');
-  _ctx=_canvas.getContext('2d');
-  _dmd=document.getElementById('pbDMD');
-  _dctx=_dmd.getContext('2d');
+/* ==========================================================================
+ * SECTION 11 — COLLIDER ASSEMBLY
+ * --------------------------------------------------------------------------
+ * Each physics frame we build the full collider list: cached static walls,
+ * + dynamic flipper colliders, + bumper circles, + target segments, + posts,
+ * + ramp side-rails (only when relevant). This single list is what BOTH the
+ * physics and the renderer use.
+ * ========================================================================== */
+function targetCollider(t) {
+  // a drop target is a fat segment across its face; ALWAYS SOLID regardless
+  // of t.hit. t.hit only changes color. (This was a major historical bug.)
+  if (t.vertical) {
+    // vertical bank: face is a vertical-ish segment
+    return seg(t.x, t.y - t.h/2, t.x, t.y + t.h/2,
+      { r: t.w/2, role:'target', bounce:0.9, ref:t });
+  }
+  return seg(t.x - t.w/2, t.y, t.x + t.w/2, t.y,
+    { r: t.h/2, role:'target', bounce:0.9, ref:t });
+}
+function bumperCollider(b) {
+  return circle(b.x, b.y, b.r, { role:'bumper', bounce:1.0, ref:b });
+}
+function rampRailColliders(ramp) {
+  // build left/right rail segments offset from centerline
+  const rails = [];
+  const hw = ramp.width / 2;
+  for (let i = 1; i < ramp.path.length; i++) {
+    const p0 = ramp.path[i-1], p1 = ramp.path[i];
+    let nx = -(p1.y - p0.y), ny = (p1.x - p0.x);
+    const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+    rails.push(seg(p0.x+nx*hw, p0.y+ny*hw, p1.x+nx*hw, p1.y+ny*hw,
+      { r:3, role:'ramprail', bounce:0.4, color:ramp.color }));
+    rails.push(seg(p0.x-nx*hw, p0.y-ny*hw, p1.x-nx*hw, p1.y-ny*hw,
+      { r:3, role:'ramprail', bounce:0.4, color:ramp.color }));
+  }
+  return rails;
 }
 
-function bindKeys(){
-  const kd=e=>{
-    if(e.key==='ArrowLeft'){_keys.left=true;e.preventDefault();}
-    if(e.key==='ArrowRight'){_keys.right=true;e.preventDefault();}
-    if(e.key===' '){_keys.space=true;e.preventDefault();}
-    if(e.key==='Escape') pbClose();
-  };
-  const ku=e=>{
-    if(e.key==='ArrowLeft')_keys.left=false;
-    if(e.key==='ArrowRight')_keys.right=false;
-    if(e.key===' ')_keys.space=false;
-  };
-  window.addEventListener('keydown',kd);
-  window.addEventListener('keyup',ku);
-  _ov._kd=kd; _ov._ku=ku;
+function assembleColliders(T) {
+  const list = [];
+  // static walls / slings / posts
+  for (const c of T.staticColliders) list.push(c);
+  for (const p of T.posts) list.push(p);
+  // lane gate (one-way, toggled active when a ball is leaving the lane)
+  if (T.laneGate) list.push(T.laneGate);
+  // flippers (rebuilt from current angle)
+  for (const fl of T.flippers) list.push(flipperCollider(fl));
+  // bumpers
+  for (const b of T.bumpers) list.push(bumperCollider(b));
+  // targets — ALWAYS solid
+  for (const t of T.targets) list.push(targetCollider(t));
+  return list;
 }
 
-function cleanup(){
-  if(_ov?._kd){window.removeEventListener('keydown',_ov._kd);window.removeEventListener('keyup',_ov._ku);}
-  if(_ac){try{_ac.close();}catch(e){}_ac=null;}
+/* ==========================================================================
+ * SECTION 12 — RAMP MOUNT / RIDE
+ * --------------------------------------------------------------------------
+ * mountCheck: if a ground-level ball is at a ramp mouth moving fast enough
+ * into it, attach it. rideRamp: advance a mounted ball along the centerline.
+ * ========================================================================== */
+function tryMountRamp(ball, T) {
+  if (ball.onRamp || ball.inLane) return;
+  for (const ramp of T.ramps) {
+    const entry = ramp.path[0];
+    const d = dist(ball.x, ball.y, entry.x, entry.y);
+    if (d > ramp.width * 0.9) continue;
+    // direction the ramp goes at entry
+    const rp = rampPoint(ramp, 0.02);
+    const into = (ball.vx * rp.tx + ball.vy * rp.ty);
+    const speed = Math.hypot(ball.vx, ball.vy);
+    if (into > 0 && speed >= ramp.mountSpeed) {
+      ball.onRamp = ramp;
+      ball.rampT = 0;
+      ball.rampSpeed = speed;          // scalar speed along ramp
+      snd('ramp');
+      return;
+    }
+  }
 }
-function pbClose(){cancelAnimationFrame(_animId);cleanup();_ov?.remove();_ov=null;}
+function rideRamp(ball) {
+  const ramp = ball.onRamp;
+  if (!ramp) return;
+  // gravity along a ramp: climbing costs speed, descending gains it.
+  // height delta drives a speed change.
+  const slope = (ramp.h1 - ramp.h0) / Math.max(1, ramp.total);
+  // moving up the ramp (increasing t) against slope -> decel
+  ball.rampSpeed -= slope * 0.5;          // climb drag (tuned: long orbits stay completable)
+  ball.rampSpeed *= 0.998;                 // rolling friction
+  if (ball.rampSpeed < 0) {
+    // ball stalled — roll back down
+    ball.rampSpeed = Math.max(ball.rampSpeed, -14);
+  }
+  const dt = ball.rampSpeed / Math.max(1, ramp.total);
+  ball.rampT += dt;
+  // sample position + height
+  if (ball.rampT >= 1) {
+    // EJECT at exit
+    const rp = rampPoint(ramp, 1);
+    ball.x = rp.x; ball.y = rp.y;
+    ball.z = 0; ball.vz = 0;
+    const ej = Math.max(ramp.exitBoost, ball.rampSpeed);
+    ball.vx = rp.tx * ej; ball.vy = rp.ty * ej;
+    ball.onRamp = null;
+    snd('rampDown');
+    if (ramp.onEject) ramp.onEject(ball);
+    return;
+  }
+  if (ball.rampT <= 0) {
+    // rolled back off the entry
+    const rp = rampPoint(ramp, 0);
+    ball.x = rp.x; ball.y = rp.y;
+    ball.z = 0; ball.vz = 0;
+    ball.vx = rp.tx * ball.rampSpeed; ball.vy = rp.ty * ball.rampSpeed;
+    ball.onRamp = null;
+    return;
+  }
+  const rp = rampPoint(ramp, ball.rampT);
+  ball.x = rp.x; ball.y = rp.y;
+  ball.z = rampHeight(ramp, ball.rampT);
+  // store screen velocity for trail / feel
+  ball.vx = rp.tx * ball.rampSpeed;
+  ball.vy = rp.ty * ball.rampSpeed;
+}
 
-// ─── MAIN LOOP ────────────────────────────────────────────────────────────────
-let _lastTs=0;
-function loop(ts=0){
-  _animId=requestAnimationFrame(loop);
-  const dt=Math.min((ts-_lastTs)/16.67,3);
-  _lastTs=ts;
-  update(dt);
-  draw();
+/* ==========================================================================
+ * SECTION 13 — THE PHYSICS STEP  (per ball, per frame)
+ * --------------------------------------------------------------------------
+ * 1. If on a ramp, ride it (separate integrator) and return.
+ * 2. Apply gravity. Clamp speed.
+ * 3. Integrate motion in SUBSTEPS. Within each sub-step:
+ *      a. compute remaining displacement
+ *      b. sweep against ALL colliders, find earliest time-of-impact
+ *      c. advance to just before impact
+ *      d. reflect velocity about the surface normal, apply restitution +
+ *         the special response for that collider role (bumper kick, flipper
+ *         momentum transfer, target hit, etc.)
+ *      e. consume the used time; repeat until time exhausted or no hit
+ * 4. Static depenetration safety net.
+ * 5. Worm-hole gravity + capture.
+ * 6. Anti-stuck watchdog.
+ * ========================================================================== */
+function stepBall(ball, T, colliders) {
+  if (ball.dead) return;
+
+  /* --- on a ramp: dedicated integrator --- */
+  if (ball.onRamp) {
+    rideRamp(ball);
+    pushTrail(ball);
+    return;
+  }
+
+  /* --- lane feed arc: scripted hand-off from lane mouth into open play --- */
+  if (ball.laneFeed) {
+    stepLaneFeed(ball);
+    pushTrail(ball);
+    return;
+  }
+
+  /* --- plunger lane: ball is constrained until it leaves the lane --- */
+  if (ball.inLane) {
+    stepInLane(ball, T);
+    pushTrail(ball);
+    return;
+  }
+
+  /* --- gravity --- */
+  ball.vy += PB.GRAVITY;
+
+  /* --- worm-hole gravity pull (gentle, only active holes) --- */
+  for (const wh of T.wormholes) {
+    if (!wh.active) continue;
+    const dx = wh.x - ball.x, dy = wh.y - ball.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 150 && d > wh.r) {
+      const f = wh.pull * (1 - d / 150);
+      ball.vx += (dx / d) * f;
+      ball.vy += (dy / d) * f;
+    }
+  }
+
+  /* --- speed clamp --- */
+  let sp = Math.hypot(ball.vx, ball.vy);
+  if (sp > PB.MAX_SPEED) { const k = PB.MAX_SPEED / sp; ball.vx *= k; ball.vy *= k; sp = PB.MAX_SPEED; }
+  ball.lastSpeed = sp;
+
+  /* --- substepped swept integration --- */
+  let remX = ball.vx, remY = ball.vy;     // displacement still to apply
+  let safety = 0;
+  while ((remX !== 0 || remY !== 0) && safety < 12) {
+    safety++;
+    const vel = { x: remX, y: remY };
+    // find earliest hit
+    let hit = null;
+    for (const col of colliders) {
+      // skip flippers' own pivot self etc — none needed; all valid
+      const h = sweepCircleVsCollider({ x: ball.x, y: ball.y }, vel, ball.r, col);
+      if (h && (!hit || h.t < hit.t)) { hit = h; hit.col = col; }
+    }
+    if (!hit) {
+      // free flight for the rest of the displacement
+      ball.x += remX; ball.y += remY;
+      remX = 0; remY = 0;
+      break;
+    }
+    // advance to just before contact
+    const travel = Math.max(0, hit.t - 0.0001);
+    ball.x += vel.x * travel;
+    ball.y += vel.y * travel;
+    // separation epsilon: nudge off the surface so we don't re-collide
+    ball.x += hit.nx * PB.SEP_EPS;
+    ball.y += hit.ny * PB.SEP_EPS;
+    // respond to the collision (mutates ball velocity)
+    respondCollision(ball, hit, T);
+    // remaining displacement = leftover fraction, but recomputed from the
+    // NEW (reflected) velocity so the ball continues correctly
+    const leftover = 1 - hit.t;
+    remX = ball.vx * leftover;
+    remY = ball.vy * leftover;
+  }
+
+  /* --- friction --- */
+  ball.vx *= PB.FRICTION;
+  ball.vy *= PB.FRICTION;
+
+  /* --- static depenetration safety net --- */
+  for (const col of colliders) {
+    const push = staticPush({ x: ball.x, y: ball.y }, ball.r, col);
+    if (push) {
+      ball.x += push.nx * (push.depth + PB.SEP_EPS);
+      ball.y += push.ny * (push.depth + PB.SEP_EPS);
+      // kill inward velocity component so it doesn't re-penetrate
+      const vn = ball.vx * push.nx + ball.vy * push.ny;
+      if (vn < 0) { ball.vx -= vn * push.nx; ball.vy -= vn * push.ny; }
+    }
+  }
+
+  /* --- ramp mount check --- */
+  tryMountRamp(ball, T);
+
+  /* --- worm-hole capture --- */
+  for (const wh of T.wormholes) {
+    if (!wh.active) continue;
+    if (dist(ball.x, ball.y, wh.x, wh.y) < wh.r) {
+      onWormHoleEnter(ball, wh, T);
+      break;
+    }
+  }
+  /* --- ball lock capture --- */
+  if (T.lockZone && T.lockZone.active &&
+      dist(ball.x, ball.y, T.lockZone.x, T.lockZone.y) < T.lockZone.r) {
+    onBallLock(ball, T);
+  }
+
+  /* --- top rollover lanes --- */
+  for (const ln of T.lanes) {
+    if (!ln.lit && Math.abs(ball.x - ln.x) < 18 && Math.abs(ball.y - ln.y) < 14) {
+      ln.lit = true; addScore(150); snd('target');
+      if (T.lanes.every(l => l.lit)) {
+        T.lanes.forEach(l => l.lit = false);
+        addScore(2500); _pb.mult++; dmdFlash('LANES COMPLETE', 'MULTIPLIER UP');
+        snd('group');
+      }
+    }
+  }
+
+  /* --- anti-stuck watchdog --- */
+  if (ball.lastSpeed < 1.2 && ball.y < WALL.DRAIN_Y - 40 && !ball.onRamp && !ball.inLane) {
+    ball.stuckTimer++;
+    if (ball.stuckTimer > 70 && ball.stuckTimer % 22 === 0) {
+      // escalating nudge: each pulse is stronger and aimed toward open play
+      const k = 1 + ball.stuckTimer / 70;
+      ball.vx += (ball.x < PB.W/2 ? 2.2 : -2.2) * k;
+      ball.vy += 1.6 * k;          // downward, toward the active playfield
+      _pb.shake = 6;
+    }
+    // hard failsafe: a ball that cannot be freed after ~6s is teleported to
+    // a safe spot above the flippers so play can continue.
+    if (ball.stuckTimer > 360) {
+      ball.x = PB.W/2; ball.y = 640;
+      ball.vx = rand(-1.5, 1.5); ball.vy = 3.0; ball.z = 0; ball.vz = 0;
+      ball.stuckTimer = 0;
+      _pb.shake = 9;
+    }
+  } else {
+    ball.stuckTimer = 0;
+  }
+
+  pushTrail(ball);
+
+  /* --- drain --- */
+  if (ball.y > WALL.DRAIN_Y) {
+    ball.dead = true;
+    snd('drain');
+  }
+}
+
+function pushTrail(ball) {
+  ball.trail.push({ x: ball.x, y: ball.y, z: ball.z });
+  if (ball.trail.length > 9) ball.trail.shift();
+}
+
+/* --- in-lane physics: ball constrained to plunger channel --- */
+function stepInLane(ball, T) {
+  const pl = T.plunger;
+  if (_pb.phase === 'plunge') {
+    // ball rides the plunger head
+    ball.x = pl.x;
+    ball.y = pl.headY - ball.r - 4;
+    ball.vx = 0; ball.vy = 0;
+  } else {
+    // ball has been launched, travelling up the lane
+    ball.vy += PB.GRAVITY;
+    ball.x = pl.x;             // keep centered in lane
+    ball.y += ball.vy;
+    // reached the lane mouth -> begin the scripted FEED arc. Rather than
+    // dumping the ball into the sealed right-side channel (where it would
+    // just fall straight back down), we keep it under lane control and
+    // walk it left along a feed path until it is clear of the channel and
+    // safely in open play, then hand it to the physics engine.
+    if (ball.y <= pl.top + 4 && ball.vy < 0) {
+      ball.laneFeed = true;          // enter feed-arc sub-state
+      ball.feedT = 0;
+      ball.feedSpeed = Math.min(Math.max(-ball.vy, 7), 15); // carry launch energy
+      if (T.laneGate) T.laneGate.active = true;   // gate now blocks re-entry
+    }
+    // ball fell back to bottom of lane with no power -> re-seat for plunge
+    if (ball.y > pl.bottom - ball.r - 10) {
+      ball.y = pl.bottom - ball.r - 10;
+      ball.vy = 0;
+      _pb.phase = 'plunge';
+      _pb.plungeCharge = 0;
+    }
+  }
+}
+
+/* feed arc: a short scripted path carrying the ball from the lane mouth
+ * up over the hood and down-left into open play. Runs for a fixed set of
+ * waypoints; on completion the ball is released to normal physics with a
+ * velocity tangent to the path so the hand-off is seamless. */
+const LANE_FEED_PATH = [
+  { x: 494, y: 206 },   // lane mouth
+  { x: 492, y: 150 },   // up past the gate
+  { x: 470, y: 96  },   // over the hood crest
+  { x: 430, y: 74  },   // across the top
+  { x: 372, y: 96  },   // descending left
+  { x: 332, y: 150 },   // into open field
+  { x: 312, y: 214 },   // clear of the channel — release here
+];
+function stepLaneFeed(ball) {
+  const path = LANE_FEED_PATH;
+  // advance a normalized parameter along the polyline
+  ball.feedT += (ball.feedSpeed || 9) / 240;   // ~path-length normalization
+  const segs = path.length - 1;
+  let t = ball.feedT * segs;
+  if (t >= segs) {
+    // done — release to physics with a tangent velocity (down-left)
+    const a = path[segs - 1], b = path[segs];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const L = Math.hypot(dx, dy) || 1;
+    const sp = (ball.feedSpeed || 9);
+    ball.x = b.x; ball.y = b.y;
+    ball.vx = (dx / L) * sp;
+    ball.vy = (dy / L) * sp;
+    ball.laneFeed = false;
+    ball.inLane = false;
+    return;
+  }
+  const i = Math.floor(t);
+  const f = t - i;
+  const a = path[i], b = path[i + 1];
+  ball.x = a.x + (b.x - a.x) * f;
+  ball.y = a.y + (b.y - a.y) * f;
+  ball.vx = 0; ball.vy = 0;
+}
+
+
+/* ==========================================================================
+ * SECTION 14 — COLLISION RESPONSE
+ * --------------------------------------------------------------------------
+ * Given a hit (normal nx,ny pointing at the ball, collider in hit.col),
+ * reflect the ball's velocity and apply role-specific behavior.
+ *
+ * The base reflection is:  v' = v - (1+e)(v.n) n
+ * For active elements (bumpers, slings, flippers) we ADD energy along the
+ * normal rather than only conserving it, which is what makes pinball lively.
+ * ========================================================================== */
+function respondCollision(ball, hit, T) {
+  const col = hit.col;
+  const nx = hit.nx, ny = hit.ny;
+  const vn = ball.vx * nx + ball.vy * ny;     // velocity along normal
+
+  // one-way gate: if it's the lane gate, only block from one side
+  if (col.role === 'gate') {
+    // gate only solid if ball is above it moving down (re-entry block)
+    if (vn < 0) {
+      ball.vx -= (1 + 0.2) * vn * nx;
+      ball.vy -= (1 + 0.2) * vn * ny;
+    }
+    return;
+  }
+
+  let e = col.bounce ?? PB.RESTITUTION;
+
+  // base reflection (only if moving INTO the surface)
+  if (vn < 0) {
+    ball.vx -= (1 + e) * vn * nx;
+    ball.vy -= (1 + e) * vn * ny;
+  }
+
+  switch (col.role) {
+    case 'bumper': {
+      const b = col.ref;
+      if (b.cooldown <= 0) {
+        b.cooldown = 9;          // ~150ms at 60fps
+        b.flash = 12;
+        // POP: add a fixed outward kick on top of the reflection
+        const kick = 7.5;
+        ball.vx += nx * kick;
+        ball.vy += ny * kick;
+        addScore(b.value * _pb.mult);
+        bumpCombo();
+        _pb.shake = Math.min(8, _pb.shake + 4);
+        snd('bumper');
+      }
+      break;
+    }
+    case 'sling': {
+      // slingshot: strong, snappy kick along the normal
+      const kick = 9.0;
+      ball.vx += nx * kick;
+      ball.vy += ny * kick;
+      addScore(120 * _pb.mult);
+      _pb.shake = Math.min(7, _pb.shake + 3);
+      snd('sling');
+      break;
+    }
+    case 'flipper': {
+      const fl = col.ref;
+      // momentum transfer: a moving flipper imparts the surface velocity at
+      // the contact point. Surface velocity = av (rad/frame) x radius arm.
+      const armX = hit.point.x - fl.px;
+      const armY = hit.point.y - fl.py;
+      // tangential surface velocity from angular velocity (perp of arm)
+      const surfVx = -armY * fl.av;
+      const surfVy =  armX * fl.av;
+      // add a fraction of the surface velocity into the ball
+      const transfer = 1.15;
+      ball.vx += surfVx * transfer;
+      ball.vy += surfVy * transfer;
+      // when flipper is actively swinging up and ball is near tip, give the
+      // signature "live catch -> flick" punch
+      if (fl.up && Math.abs(fl.av) > 0.05) {
+        const armLen = Math.hypot(armX, armY) / fl.len; // 0..1 along flipper
+        const punch = 4 + armLen * 5;
+        ball.vx += nx * punch;
+        ball.vy += ny * punch;
+      }
+      snd('flipper');
+      break;
+    }
+    case 'target': {
+      const t = col.ref;
+      if (!t.hit) {
+        t.hit = true;
+        t.flash = 18;
+        addScore(t.value * _pb.mult);
+        bumpCombo();
+        snd('target');
+        onTargetHit(t, T);
+      } else {
+        // already-down target is STILL a solid wall — just a quieter bounce
+        snd('wall');
+      }
+      break;
+    }
+    case 'ramprail':
+      snd('wall');
+      break;
+    case 'post':
+    case 'wall':
+    default:
+      if (Math.abs(vn) > 3) snd('wall');
+      break;
+  }
+
+  // never let response leave the ball moving into the surface
+  const vn2 = ball.vx * nx + ball.vy * ny;
+  if (vn2 < 0) { ball.vx -= vn2 * nx; ball.vy -= vn2 * ny; }
+}
+
+/* ==========================================================================
+ * SECTION 15 — SCORING & COMBO
+ * ========================================================================== */
+function addScore(n) { _pb.score += Math.round(n); }
+function bumpCombo() {
+  _pb.combo++;
+  _pb.comboTimer = 90;
+  if (_pb.combo > 0 && _pb.combo % 5 === 0) {
+    dmdFlash(_pb.combo + 'X COMBO', '+' + (_pb.combo * 200));
+    addScore(_pb.combo * 200);
+    snd('group');
+  }
+}
+
+/* ==========================================================================
+ * SECTION 16 — WORM HOLER GAME LOGIC
+ * ========================================================================== */
+function onTargetHit(t, T) {
+  // count completion of a bank
+  const bank = T.targets.filter(x => x.group === t.group);
+  const done = bank.every(x => x.hit);
+  if (done) {
+    if (t.group === 'worm') {
+      T.wormProgress++;
+      activateWormHole(T);
+      dmdFlash('WORM COMPLETE', 'HOLE ' + Math.min(T.activeHoles, 4) + ' OPEN');
+      addScore(3000 * _pb.mult);
+    } else if (t.group === 'hole') {
+      T.holeProgress++;
+      activateWormHole(T);
+      dmdFlash('HOLE COMPLETE', 'WORMHOLE CHARGED');
+      addScore(3000 * _pb.mult);
+    }
+    snd('group');
+    // reset the bank after a beat (drop targets pop back up)
+    setTimeout(() => { bank.forEach(x => { x.hit = false; }); }, 900);
+  }
+}
+
+function activateWormHole(T) {
+  // turn on the next inactive worm hole
+  for (const wh of T.wormholes) {
+    if (!wh.active) {
+      wh.active = true;
+      T.activeHoles++;
+      snd('wormActivate');
+      break;
+    }
+  }
+  if (T.activeHoles >= 4 && !T.multiballArmed) {
+    T.multiballArmed = true;
+    dmdFlash('WORMHOLES ALIGNED', 'LOCK BALL FOR MULTIBALL');
+  }
+}
+
+function onWormHoleEnter(ball, wh, T) {
+  // teleport ball to a random OTHER active hole
+  const others = T.wormholes.filter(h => h.active && h !== wh);
+  addScore(1500 * _pb.mult);
+  snd('wormhole');
+  _pb.shake = 8;
+  if (others.length === 0) {
+    // single active hole: kick the ball back out
+    ball.vx = rand(-5, 5); ball.vy = -rand(6, 9);
+    return;
+  }
+  const dest = others[randi(0, others.length - 1)];
+  ball.x = dest.x; ball.y = dest.y;
+  // eject with some speed in a random downward-ish direction
+  const a = rand(Math.PI * 0.15, Math.PI * 0.85);
+  const s = rand(7, 10);
+  ball.vx = Math.cos(a) * s;
+  ball.vy = Math.abs(Math.sin(a) * s);
+  dmdFlash('WORMHOLE JUMP', '+' + (1500 * _pb.mult));
+  bumpCombo();
+}
+
+function onBallLock(ball, T) {
+  if (!T.lockZone.active) return;
+  if (T.multiballArmed && _pb.balls.length === 1) {
+    // START MULTIBALL
+    T.lockZone.active = false;
+    T.multiballArmed = false;
+    snd('multiball');
+    dmdFlash('MULTIBALL', 'QUANTUM ENTANGLEMENT');
+    _pb.mult = Math.max(_pb.mult, 2);
+    // ball that entered is re-ejected, plus 2 more spawn
+    ejectFromLock(ball, T);
+    for (let i = 0; i < 2; i++) {
+      const nb = Ball(T.lockZone.x, T.lockZone.y);
+      nb.inLane = false;
+      ejectFromLock(nb, T);
+      _pb.balls.push(nb);
+    }
+    setTimeout(() => { if (_table) T.lockZone.active = true; }, 6000);
+  } else {
+    // not armed: lock just scores + kicks ball out
+    addScore(2000 * _pb.mult);
+    snd('lock');
+    ejectFromLock(ball, T);
+  }
+}
+function ejectFromLock(ball, T) {
+  const a = rand(Math.PI * 0.2, Math.PI * 0.8);
+  const s = rand(7, 11);
+  ball.x = T.lockZone.x; ball.y = T.lockZone.y + T.lockZone.r + 2;
+  ball.vx = Math.cos(a) * s;
+  ball.vy = Math.abs(Math.sin(a) * s);
+  ball.onRamp = null; ball.inLane = false; ball.dead = false;
+}
+
+
+/* ==========================================================================
+ * SECTION 17 — GAME LOOP
+ * ========================================================================== */
+function startGame() {
+  _pb = freshPB();
+  _pb.highScore = loadHighScore(_table.id);
+  _pb.phase = 'plunge';
+  _pb.started = true;
+  // reset table logic
+  resetTableLogic(_table);
+  spawnBallInLane();
+}
+function resetTableLogic(T) {
+  T.wormProgress = 0; T.holeProgress = 0; T.activeHoles = 0;
+  T.locked = 0; T.multiballArmed = false;
+  for (const wh of T.wormholes) { wh.active = false; }
+  for (const t of T.targets) { t.hit = false; t.flash = 0; }
+  for (const b of T.bumpers) { b.cooldown = 0; b.flash = 0; }
+  for (const ln of T.lanes) { ln.lit = false; }
+  if (T.lockZone) T.lockZone.active = true;
+}
+function spawnBallInLane() {
+  const pl = _table.plunger;
+  const b = Ball(pl.x, pl.bottom - PB.BALL_R - 10);
+  b.inLane = true;
+  _pb.balls = [b];
+  _pb.phase = 'plunge';
+  _pb.plungeCharge = 0;
+  if (_table.laneGate) _table.laneGate.active = true; // gate solid while in lane
+}
+
+function loseBall() {
+  _pb.combo = 0; _pb.mult = 1;
+  if (_pb.ball >= _pb.ballsTotal) {
+    // GAME OVER
+    _pb.phase = 'gameover';
+    if (_pb.score > _pb.highScore) {
+      _pb.highScore = _pb.score;
+      saveHighScore(_table.id, _pb.score);
+    }
+    snd('gameover');
+  } else {
+    _pb.ball++;
+    _pb.phase = 'balllost';
+    _pb.dmd.timer = 90;
+    setTimeout(() => {
+      if (!_running) return;
+      resetBallElementsForNewBall(_table);
+      spawnBallInLane();
+    }, 1600);
+  }
+}
+function resetBallElementsForNewBall(T) {
+  // worm holes / progress persist across balls (design choice — keeps it
+  // rewarding). Only transient flags reset.
+  for (const b of T.bumpers) { b.cooldown = 0; }
+}
+
+function tick(now) {
+  if (!_running) return;
+  _raf = requestAnimationFrame(tick);
+  const dtMs = Math.min(50, now - _lastT || 16);
+  _lastT = now;
+  _pb.tick++;
+
+  // ---- input -> flippers ----
+  for (const fl of _table.flippers) {
+    const k = fl.side === 'L' ? _keys.left : _keys.right;
+    fl.up = k;
+    updateFlipper(fl);
+  }
+
+  // ---- plunger ----
+  if (_pb.phase === 'plunge') {
+    const pl = _table.plunger;
+    if (_keys.space) {
+      _pb.plungeCharge = clamp(_pb.plungeCharge + 0.022, 0, 1);
+    }
+    pl.headY = lerp(pl.headRest, pl.headDeep, _pb.plungeCharge);
+    // keep ball seated on head
+    const ball = _pb.balls[0];
+    if (ball) { ball.x = pl.x; ball.y = pl.headY - ball.r - 4; }
+  }
+
+  // ---- physics ----
+  if (_pb.phase === 'play' || _pb.phase === 'plunge') {
+    const colliders = assembleColliders(_table);
+    // bumper cooldown / flash decay
+    for (const b of _table.bumpers) { if (b.cooldown > 0) b.cooldown--; if (b.flash > 0) b.flash--; }
+    for (const t of _table.targets) { if (t.flash > 0) t.flash--; }
+    for (const wh of _table.wormholes) { wh.swirl += 0.08; }
+
+    for (const ball of _pb.balls) stepBall(ball, _table, colliders);
+
+    // remove drained balls
+    const before = _pb.balls.length;
+    _pb.balls = _pb.balls.filter(b => !b.dead);
+    if (_pb.balls.length === 0 && before > 0 && _pb.phase === 'play') {
+      loseBall();
+    }
+    // combo timer
+    if (_pb.comboTimer > 0) { _pb.comboTimer--; if (_pb.comboTimer === 0) _pb.combo = 0; }
+    if (_pb.shake > 0) _pb.shake *= 0.85;
+  }
+
+  // ---- dmd timer ----
+  if (_pb.dmd.timer > 0) _pb.dmd.timer--;
+  _pb.dmd.t++;
+
+  // ---- render ----
+  drawPlayfield();
   drawDMD();
 }
 
-// ─── UPDATE ───────────────────────────────────────────────────────────────────
-function update(dt){
-  _pb.phaseTimer+=dt;
-  if(_pb.dmdFlash>0)_pb.dmdFlash-=dt;
-  _pb.pulses=_pb.pulses.filter(p=>{p.life-=dt;return p.life>0;});
-  _pb.strobes=_pb.strobes.filter(s=>{s.life-=dt;return s.life>0;});
-  _pb.lights.forEach(l=>{l.phase+=l.speed*dt;});
-  if(_pb.combo>0){_pb.comboTimer-=dt;if(_pb.comboTimer<=0)_pb.combo=0;}
-  if(_pb.modeActive&&_pb.modeTimer>0){_pb.modeTimer-=dt;if(_pb.modeTimer<=0)endMode();}
-
-  switch(_pb.phase){
-    case 'attract': if(_pb.phaseTimer>4||anyKey()) startBall(); break;
-    case 'plunge':  updatePlunge(dt); break;
-    case 'play':    updatePlay(dt); break;
-    case 'lost':    if(_pb.phaseTimer>2.2){_pb.ballsLeft<=0?endGame():startBall();} break;
-    case 'gameover':if(_pb.phaseTimer>2.8){saveScore();_pb.phase='scores';_pb.phaseTimer=0;} break;
-    case 'scores':  if(anyKey()&&_pb.phaseTimer>1) restartGame(); break;
-  }
-}
-
-function anyKey(){return _keys.left||_keys.right||_keys.space;}
-
-function updateFlippers(dt){
-  _pb.flippers.forEach(f => {
-    const want = (f.side==='left' && _keys.left) ||
-                 (f.side==='right' && _keys.right);
-    if(want !== f.active){
-      f.active = want;
-      if(want) snd('flipper');
-    }
-  });
-}
-
-function updatePlunge(dt){
-  updateFlippers(dt);
-  if(_keys.space){
-    _pb.plungerCharge=Math.min(_pb.plungerCharge+0.55*dt,PB.PLUNGER_MAX);
-  } else if(_pb.plungerCharge>0){
-    launchBall();
-    return;
-  }
-  // Keep ball sitting on plunger head — moves UP as charge increases
-  const laneBot=PB.H-90, laneTop=90, laneH=laneBot-laneTop;
-  const charge=_pb.plungerCharge/PB.PLUNGER_MAX;
-  const springH=charge*laneH*0.62;
-  const springY=laneBot-springH;
-  _pb.ball.x=PB.W-26;
-  _pb.ball.y=springY-9-PB.BALL_R; // ball center above plunger head
-  _pb.ball.vx=0; _pb.ball.vy=0;
-}
-
-function updatePlay(dt){
-  updateFlippers(dt);
-  updateBall(_pb.ball,dt);
-  _pb.extras.forEach(b=>updateBall(b,dt));
-  _pb.extras=_pb.extras.filter(b=>!b.lost);
-  if(_pb.ball.lost&&_pb.extras.length===0){
-    _pb.ballsLeft--;
-    _pb.phase='lost'; _pb.phaseTimer=0;
-    dmd('BALL LOST!','');
-    snd('drain');
-  }
-  _table.logic&&_table.logic(dt);
-}
-
-// ─── BALL PHYSICS ─────────────────────────────────────────────────────────────
-function flipAngle(f){
-  if(f.side==='left')  return f.active ? FL.ACT_L : FL.REST_L;
-  else                 return f.active ? FL.ACT_R : FL.REST_R;
-}
-
-function flipTip(f){
-  const a = flipAngle(f);
-  return { x: f.x + FL.len*Math.cos(a), y: f.y + FL.len*Math.sin(a) };
-}
-
-function updateBall(b,dt){
-  if(!b.active||b.lost)return;
-
-  // ── Gravity ──────────────────────────────────────────────────────────────
-  b.vy += 0.30 * dt;
-
-  // ── Move ─────────────────────────────────────────────────────────────────
-  b.x += b.vx * dt;
-  b.y += b.vy * dt;
-
-  // ── Speed cap ────────────────────────────────────────────────────────────
-  const spd = Math.hypot(b.vx, b.vy);
-  if(spd > 28){ const s=28/spd; b.vx*=s; b.vy*=s; }
-  b.vx *= 0.9994; b.vy *= 0.9994; // very light friction
-
-  // ── Wall collisions ───────────────────────────────────────────────────────
-  const r = PB.BALL_R;
-  if(b.x - r < wallL){ b.x = wallL+r; b.vx = Math.abs(b.vx)*0.60; snd('wall'); }
-  if(b.x + r > wallR){ b.x = wallR-r; b.vx = -Math.abs(b.vx)*0.60; snd('wall'); }
-  if(b.y - r < wallT){ b.y = wallT+r; b.vy = Math.abs(b.vy)*0.60; snd('wall'); }
-
-  // ── Plunger lane right wall ───────────────────────────────────────────────
-  // Ball in plunger lane (x > wallR-8) bounces off PB.W-8
-  if(b.x > wallR-8){
-    if(b.x + r > PB.W-8){ b.x=PB.W-8-r; b.vx=-Math.abs(b.vx)*0.55; }
-    // Exit arc at top: when ball rises above y=120, kick left onto playfield
-    if(b.y < 120 && b.vy < 0){
-      b.vx = -Math.abs(b.vx)*0.6 - 5;
-      b.vy *= 0.5;
-      b.x = wallR - 20;
-    }
-    // Ball falls back — reset to plunge
-    if(b.vy > 0 && b.y > PB.H - 180 && _pb.phase === 'play'){
-      b.x=PB.W-26; b.y=PB.H-110; b.vx=0; b.vy=0;
-      _pb.phase='plunge'; _pb.plungerCharge=0;
-      dmd('PULL AND RELEASE','TRY AGAIN!');
-    }
-    return; // don't apply other physics while in plunger lane
-  }
-
-  // ── Bumpers ───────────────────────────────────────────────────────────────
-  _pb.bumpers.forEach(bmp => {
-    if(bmp.cooldown > 0){ bmp.cooldown -= dt; return; }
-    const dx=b.x-bmp.x, dy=b.y-bmp.y, d=Math.hypot(dx,dy);
-    if(d < bmp.r + r){
-      const nx=dx/d||0, ny=dy/d||1;
-      // Push ball cleanly outside
-      b.x = bmp.x + nx*(bmp.r+r+2);
-      b.y = bmp.y + ny*(bmp.r+r+2);
-      // Exit velocity: away from bumper, minimum speed
-      const exitSpd = Math.max(8, spd*0.7+5);
-      b.vx = nx*exitSpd; b.vy = ny*exitSpd;
-      bmp.cooldown = 0.15;
-      bmp.hits++; bmp.flashTimer = 0.4;
-      addPts(bmp.pts*_pb.multiplier, bmp.x, bmp.y);
-      _pb.combo++; _pb.comboTimer = 3;
-      _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r,life:0.45,max:0.45,color:bmp.ring,type:'ring'});
-      _pb.pulses.push({x:bmp.x,y:bmp.y,r:bmp.r*0.4,life:0.2,max:0.2,color:'#fff',type:'fill'});
-      _pb.strobes.push({x:bmp.x,y:bmp.y,r:bmp.r*3.5,life:0.3,max:0.3,color:bmp.ring});
-      snd('bumper');
-      _table.onBumper && _table.onBumper(bmp);
-    }
-    if(bmp.flashTimer > 0) bmp.flashTimer -= dt;
-  });
-
-  // ── Slingshots ────────────────────────────────────────────────────────────
-  _pb.slings.forEach(s => {
-    if(b.x+r>s.x && b.x-r<s.x+s.w && b.y+r>s.y && b.y-r<s.y+s.h){
-      b.vx = s.kickVx + (Math.random()-0.5)*1.5;
-      b.vy = s.kickVy - Math.random()*1.5;
-      addPts(s.pts*_pb.multiplier, s.x+s.w/2, s.y+s.h/2);
-      _pb.pulses.push({x:s.x+s.w/2,y:s.y+s.h/2,r:22,life:0.22,max:0.22,color:s.color,type:'ring'});
-      snd('bumper');
-    }
-  });
-
-  // ── Drop targets — SOLID even when hit ───────────────────────────────────
-  // Targets remain as physical walls regardless of hit state
-  // Hitting them just changes their visual color
-  const allTargets = [
-    ..._pb.targets,
-    ..._pb.dropBanks.flatMap(bk=>bk.targets)
-  ];
-  allTargets.forEach(t => {
-    const inX = b.x+r > t.x && b.x-r < t.x+t.w;
-    const inY = b.y+r > t.y && b.y-r < t.y+t.h;
-    if(inX && inY){
-      // Determine which face ball hit (find shortest overlap axis)
-      const overlapL = (b.x+r) - t.x;
-      const overlapR = (t.x+t.w) - (b.x-r);
-      const overlapT = (b.y+r) - t.y;
-      const overlapB = (t.y+t.h) - (b.y-r);
-      const minH = Math.min(overlapL, overlapR);
-      const minV = Math.min(overlapT, overlapB);
-      if(minH < minV){
-        // Horizontal collision
-        if(overlapL < overlapR){ b.x=t.x-r; b.vx=-Math.abs(b.vx)*0.55; }
-        else                    { b.x=t.x+t.w+r; b.vx=Math.abs(b.vx)*0.55; }
-      } else {
-        // Vertical collision
-        if(overlapT < overlapB){ b.y=t.y-r; b.vy=-Math.abs(b.vy)*0.55; }
-        else                    { b.y=t.y+t.h+r; b.vy=Math.abs(b.vy)*0.55; }
-      }
-      // Score only on first hit
-      if(!t.hit){
-        t.hit=true; t.flashTimer=0.5;
-        addPts(t.pts*_pb.multiplier, t.x+t.w/2, t.y+t.h/2);
-        _pb.pulses.push({x:t.x+t.w/2,y:t.y+t.h/2,r:18,life:0.32,max:0.32,color:t.color,type:'ring'});
-        snd('target');
-        checkGroup(t.group);
-      }
-    }
-    if(t.flashTimer>0) t.flashTimer-=dt;
-  });
-
-  // ── Kicker holes ─────────────────────────────────────────────────────────
-  _pb.kickers.forEach(k => {
-    if(Math.hypot(b.x-k.x, b.y-k.y) < k.r+r){
-      b.vx=k.vx; b.vy=k.vy;
-      addPts(k.pts*_pb.multiplier, k.x, k.y);
-      _pb.pulses.push({x:k.x,y:k.y,r:k.r*2,life:0.4,max:0.4,color:k.color,type:'ring'});
-      snd('bumper');
-    }
-  });
-
-  // ── Flipper collision ─────────────────────────────────────────────────────
-  _pb.flippers.forEach(f => {
-    const a  = flipAngle(f);
-    const px = f.x, py = f.y;
-    const tx = px + FL.len*Math.cos(a), ty = py + FL.len*Math.sin(a);
-    // Project ball onto flipper line segment
-    const dx=tx-px, dy=ty-py, lenSq=dx*dx+dy*dy;
-    let t2 = ((b.x-px)*dx+(b.y-py)*dy)/lenSq;
-    t2 = Math.max(0, Math.min(1, t2));
-    const cx=px+t2*dx, cy=py+t2*dy;
-    const ex=b.x-cx, ey=b.y-cy, ed=Math.hypot(ex,ey);
-    const thick = FL.w/2 + r;
-    if(ed < thick && ed > 0){
-      const nx=ex/ed, ny=ey/ed;
-      // Push ball outside flipper surface
-      b.x = cx + nx*(thick+1);
-      b.y = cy + ny*(thick+1);
-      // Reflect velocity
-      const dot = b.vx*nx + b.vy*ny;
-      b.vx -= 2*dot*nx*0.65;
-      b.vy -= 2*dot*ny*0.65;
-      if(f.active){
-        // Add launch velocity component upward along flipper normal
-        const boost = f.side==='left' ? 1 : -1;
-        b.vy += ny < 0 ? -14 : -8;   // strong upward kick
-        b.vx += boost * 5;
-        snd('flipper');
-      }
-    }
-  });
-
-  // ── Lock holes ────────────────────────────────────────────────────────────
-  checkLocks(b);
-
-  // ── Ramp entry ───────────────────────────────────────────────────────────
-  checkRampEntry(b);
-
-  // ── Worm holes ────────────────────────────────────────────────────────────
-  checkWormHoles(b);
-
-  // ── Drain check ──────────────────────────────────────────────────────────
-  // Ball drains if it passes below DRAIN_Y (below flipper REST tips)
-  // OR if it falls into left/right gutters past the flipper pivots
-  const tip = flipTip(_pb.flippers[0]); // left flipper rest tip
-  const centerGapL = tip.x;
-  const centerGapR = PB.W - tip.x; // symmetric
-  const pastFlippers = b.y > FL.y + 50; // clearly below pivot
-  const inGutter = (b.x < inlaneL && b.y > FL.y - 20) ||
-                   (b.x > inlaneR && b.y > FL.y - 20);
-  const inCenterDrain = b.x > centerGapL - 5 && b.x < centerGapR + 5 && b.y > DRAIN_Y;
-  if(inCenterDrain || inGutter){ b.lost=true; }
-}
-
-
-function checkRampEntry(b){
-  if(b.z>0)return;
-  _pb.ramps.forEach(r=>{
-    const ep=r.path[0];
-    if(Math.hypot(b.x-ep.x,b.y-ep.y)<22&&Math.hypot(b.vx,b.vy)>4.5){
-      b.z=1; b.vz=0.4;
-      addPts(500*_pb.multiplier,ep.x,ep.y);
-      snd('ramp');
-      const np=r.path[1];
-      const ang=Math.atan2(np.y-ep.y,np.x-ep.x);
-      const spd=Math.hypot(b.vx,b.vy)*1.15;
-      b.vx=Math.cos(ang)*spd; b.vy=Math.sin(ang)*spd;
-      r.lit=true; r.litTimer=2;
-      // Arrow lights along ramp
-      r.path.forEach((_,i)=>{
-        setTimeout(()=>{
-          _pb.pulses.push({x:r.path[i].x,y:r.path[i].y,r:6,life:0.4,max:0.4,color:r.color,type:'ring'});
-        },i*120);
-      });
-      setTimeout(()=>{
-        if(b.active&&!b.lost){
-          b.x=r.exitX;b.y=r.exitY;
-          b.vx=r.exitVx*5;b.vy=r.exitVy*5;
-          b.z=0;b.vz=0;
-          addPts(1500*_pb.multiplier,r.exitX,r.exitY);
-        }
-      },r.travelMs||900);
-    }
-  });
-  _pb.ramps.forEach(r=>{if(r.litTimer>0){r.litTimer-=0.016;if(r.litTimer<=0)r.lit=false;}});
-}
-
-// ─── WORM HOLES ───────────────────────────────────────────────────────────────
-function checkWormHoles(b){
-  _pb.wormHoles.filter(w=>w.active).forEach(w=>{
-    if(Math.hypot(b.x-w.x,b.y-w.y)<w.r+PB.BALL_R){
-      const exits=_pb.wormHoles.filter(e=>e.active&&e!==w);
-      if(exits.length){
-        const dest=exits[Math.floor(Math.random()*exits.length)];
-        b.x=dest.x;b.y=dest.y;
-        b.vx=(Math.random()-0.5)*8;b.vy=-4-Math.random()*4;
-        addPts(5000*_pb.multiplier,dest.x,dest.y);
-        _pb.strobes.push({x:dest.x,y:dest.y,r:80,life:0.6,max:0.6,color:w.color});
-        snd('wormHole');
-        dmd('QUANTUM LEAP!','');
-      }
-    }
-  });
-}
-
-// ─── LOCKS & MULTIBALL ────────────────────────────────────────────────────────
-function checkLocks(b){
-  _pb.locks.forEach(lk=>{
-    if(lk.locked)return;
-    if(Math.hypot(b.x-lk.x,b.y-lk.y)<lk.r+PB.BALL_R){
-      lk.locked=true;
-      b.active=false;
-      addPts(3000*_pb.multiplier,lk.x,lk.y);
-      dmd('BALL LOCKED!','SHOOT TO RELEASE');
-      snd('groupComplete');
-      // Launch multiball after 1.5s
-      setTimeout(()=>{
-        lk.locked=false;
-        b.active=true; b.x=lk.x;b.y=lk.y;
-        b.vx=(Math.random()-0.5)*6;b.vy=-8;
-        startMultiball(1);
-      },1500);
-    }
-  });
-}
-
-function startMultiball(extra){
-  if(_pb.extras.length>=3)return;
-  snd('multiball');
-  dmd('MULTIBALL!','');
-  for(let i=0;i<extra;i++){
-    _pb.extras.push({
-      x:PB.W/2+(Math.random()-0.5)*80,y:350,
-      vx:(Math.random()-0.5)*10,vy:-6-Math.random()*5,
-      z:0,vz:0,active:true,lost:false
-    });
-  }
-  _pb.multiplier=Math.min(_pb.multiplier+1,6);
-}
-
-// ─── TARGET GROUPS ────────────────────────────────────────────────────────────
-function checkGroup(group){
-  if(!group)return;
-  const g=_pb.targets.filter(t=>t.group===group);
-  const bankG=_pb.dropBanks.flatMap(b=>b.targets).filter(t=>t.group===group);
-  const all=[...g,...bankG];
-  if(all.length&&all.every(t=>t.hit)){
-    groupComplete(group);
-    setTimeout(()=>all.forEach(t=>t.hit=false),1200);
-  }
-}
-
-function groupComplete(group){
-  addPts(3000*_pb.multiplier,PB.W/2,PB.H/2);
-  snd('groupComplete');
-  _pb.strobes.push({x:PB.W/2,y:PB.H/2,r:300,life:0.5,max:0.5,color:_tdef?.accentColor||'#fff'});
-  _table.onGroup&&_table.onGroup(group);
-}
-
-// ─── MODES ────────────────────────────────────────────────────────────────────
-function triggerMode(name,dur,sub){
-  _pb.modeActive=name; _pb.modeTimer=dur;
-  snd('modeStart');
-  dmd(name.toUpperCase().replace(/([A-Z])/g,' $1').trim()+'!',sub||'');
-}
-function endMode(){
-  addPts(8000*_pb.multiplier,PB.W/2,400);
-  dmd('MODE COMPLETE!','');
-  snd('modeEnd');
-  _pb.modeActive=null;
-}
-function dmd(msg,sub){_pb.dmdMsg=msg;_pb.dmdSub=sub||'';_pb.dmdFlash=2.5;}
-
-// ─── BALL START / END ─────────────────────────────────────────────────────────
-function startBall(){
-  // Ball rests at BOTTOM of plunger lane, sitting on the plunger head
-  // laneBot=PB.H-90=730, plunger head r=9, ball r=11 => ball center at 730-20=710
-  _pb.ball={x:PB.W-26,y:PB.H-110,vx:0,vy:0,z:0,vz:0,active:true,lost:false};
-  _pb.extras=[]; _pb.plungerCharge=0; _pb.launched=false;
-  _pb.targets.forEach(t=>t.hit=false);
-  _pb.dropBanks.forEach(bk=>bk.targets.forEach(t=>t.hit=false));
-  _pb.bumpers.forEach(b=>{b.cooldown=0;b.flashTimer=0;});
-  _pb.ballNum=4-_pb.ballsLeft;
-  _pb.phase='plunge'; _pb.phaseTimer=0;
-  dmd('PULL AND RELEASE','GOOD LUCK!');
-}
-
-function launchBall(){
-  // Ball is currently sitting on the plunger head somewhere in the lane.
-  // Release: give it full upward velocity from current position.
-  // Minimum velocity ensures ball always makes it to the exit arc.
-  const minVy=18; // enough to reach top from rest position
-  _pb.ball.vy=-Math.max(_pb.plungerCharge*1.15, minVy);
-  _pb.ball.vx=-0.3; // slight left nudge so ball curves toward playfield exit
-  _pb.plungerCharge=0; _pb.launched=true;
-  _pb.phase='play';
+/* launch the ball from the plunger */
+function launchBall() {
+  if (_pb.phase !== 'plunge') return;
+  const ball = _pb.balls[0];
+  if (!ball) return;
+  const power = _pb.plungeCharge;
+  _pb.plungePower = power;
+  // deterministic launch: min velocity guarantees lane exit, charge adds more
+  ball.vy = -(13 + power * 16);
+  ball.inLane = true;            // still in lane, now travelling
+  _pb.phase = 'play';
+  _pb.plungeCharge = 0;
+  _table.plunger.headY = _table.plunger.headRest;
+  if (_table.laneGate) _table.laneGate.active = true; // blocks re-entry only
   snd('launch');
+  // skill shot: if launched at near-full power, light a lane
+  if (power > 0.85) dmdFlash('FULL PLUNGE', 'SKILL SHOT LIT');
 }
 
-function endGame(){
-  _pb.phase='gameover'; _pb.phaseTimer=0;
-  dmd('GAME OVER','');
-  snd('gameOver');
-}
+/* ==========================================================================
+ * SECTION 18 — RENDER: PLAYFIELD
+ * --------------------------------------------------------------------------
+ * The renderer draws the SAME collider data physics uses, plus decorative
+ * fills. The ball is drawn with a z-based scale + a drop shadow offset by z,
+ * which is what makes ramp elevation read clearly.
+ * ========================================================================== */
+function drawPlayfield() {
+  const ctx = _pfCtx, T = _table;
+  const sx = (_pb.shake > 0.4) ? rand(-_pb.shake, _pb.shake) : 0;
+  const sy = (_pb.shake > 0.4) ? rand(-_pb.shake, _pb.shake) : 0;
+  ctx.save();
+  ctx.translate(sx, sy);
 
-function saveScore(){
-  const e={score:_pb.score,date:new Date().toLocaleDateString()};
-  _pb.highScores.push(e);
-  _pb.highScores.sort((a,b)=>b.score-a.score);
-  _pb.highScores=_pb.highScores.slice(0,8);
-  localStorage.setItem('pb_hi_'+_table.id,JSON.stringify(_pb.highScores));
-  const match=Math.floor(Math.random()*10);
-  _pb.lastMatch={match,won:(_pb.score%10)===match};
-}
+  // background gradient
+  const g = ctx.createLinearGradient(0, 0, 0, PB.H);
+  g.addColorStop(0, T.colors.mid);
+  g.addColorStop(1, T.colors.bg);
+  ctx.fillStyle = g;
+  ctx.fillRect(-20, -20, PB.W + 40, PB.H + 40);
 
-function restartGame(){
-  const id=_table.id;
-  const hi=_pb.highScores;
-  _pb=freshPB(id);
-  _table=buildTable(id);
-  applyTableToPB();
-  _pb.highScores=hi;
-  _pb.phase='attract'; _pb.phaseTimer=0;
-}
-
-function addPts(pts,x,y){
-  _pb.score+=Math.floor(pts);
-  _pb.pulses.push({x,y,r:0,life:0.9,max:0.9,pts:Math.floor(pts),type:'score'});
-}
-
-// ─── TABLE DEFINITIONS ────────────────────────────────────────────────────────
-function buildTable(id){
-  switch(id){
-    case 'worm_holer':    return tableWormHoler();
-    case 'barfs_house':   return tableBarfsHouse();
-    case 'shower_defense':return tableShowerDefense();
-    default:              return tableWormHoler();
+  // subtle starfield
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  for (let i = 0; i < 60; i++) {
+    const x = (i * 97 + 13) % PB.W;
+    const y = (i * 173 + 31) % PB.H;
+    const tw = 0.5 + 0.5 * Math.sin(_pb.tick * 0.04 + i);
+    ctx.globalAlpha = 0.15 + tw * 0.25;
+    ctx.fillRect(x, y, 2, 2);
   }
-}
+  ctx.globalAlpha = 1;
 
-// Standard flipper pair (all tables share this base)
-function stdFlippers(extraFlippers=[]){
-  return [
-    {x:FL.leftX,  y:FL.y, len:FL.len, w:FL.w, side:'left',  active:false},
-    {x:FL.rightX, y:FL.y, len:FL.len, w:FL.w, side:'right', active:false},
-    ...extraFlippers
-  ];
-}
+  // ---- ramps: draw as elevated translucent channels (drawn first, under) ----
+  for (const ramp of T.ramps) drawRamp(ctx, ramp);
 
-// ════════════════════════════════════════════════════════
-// WORM HOLER
-// ════════════════════════════════════════════════════════
-function tableWormHoler(){
-  // Mid-table flippers (smaller, same buttons)
-  const flippers=stdFlippers([
-    {x:110,y:530,angle:-0.42,len:55,w:9,side:'left', active:false,z:0},
-    {x:370,y:530,angle:Math.PI+0.42,len:55,w:9,side:'right',active:false,z:0},
-  ]);
+  // ---- worm holes ----
+  for (const wh of T.wormholes) drawWormHole(ctx, wh);
 
-  // Bumpers spread min 85px center-to-center to prevent ping-pong traps
-  const bumpers=[
-    {x:168,y:210,r:24,label:'SOL',   pts:100,color:'#2244ff',ring:'#6699ff',hits:0,flashTimer:0,cooldown:0},
-    {x:312,y:190,r:24,label:'VEGA',  pts:150,color:'#8822ff',ring:'#cc66ff',hits:0,flashTimer:0,cooldown:0},
-    {x:240,y:265,r:22,label:'CORE',  pts:200,color:'#ff2244',ring:'#ff7799',hits:0,flashTimer:0,cooldown:0},
-    {x:152,y:335,r:20,label:'NOVA',  pts:120,color:'#2266ff',ring:'#55aaff',hits:0,flashTimer:0,cooldown:0},
-    {x:328,y:325,r:20,label:'CYGNUS',pts:120,color:'#9922ff',ring:'#dd66ff',hits:0,flashTimer:0,cooldown:0},
-    {x:178,y:142,r:18,label:'DEEP',  pts:300,color:'#ff4400',ring:'#ff9966',hits:0,flashTimer:0,cooldown:0},
-    {x:302,y:130,r:18,label:'VOID',  pts:300,color:'#4400ff',ring:'#8855ff',hits:0,flashTimer:0,cooldown:0},
-  ];
-
-  // Slingshots (triangular kickers on sides, classic pinball feature)
-  const slings=[
-    {x:60, y:600,w:22,h:80,kickVx:7, kickVy:-5,color:'#4488ff',pts:50},  // left
-    {x:398,y:600,w:22,h:80,kickVx:-7,kickVy:-5,color:'#4488ff',pts:50},  // right
-  ];
-
-  // Drop target banks
-  const dropBanks=[
-    {label:'WORM',targets:[
-      {x:68,y:420,w:16,h:32,label:'W',pts:400,color:'#4488ff',hit:false,flashTimer:0,group:'worm'},
-      {x:68,y:456,w:16,h:32,label:'O',pts:400,color:'#4488ff',hit:false,flashTimer:0,group:'worm'},
-      {x:68,y:492,w:16,h:32,label:'R',pts:400,color:'#4488ff',hit:false,flashTimer:0,group:'worm'},
-      {x:68,y:528,w:16,h:32,label:'M',pts:400,color:'#4488ff',hit:false,flashTimer:0,group:'worm'},
-    ]},
-    {label:'HOLE',targets:[
-      {x:396,y:420,w:16,h:32,label:'H',pts:400,color:'#ff44cc',hit:false,flashTimer:0,group:'hole'},
-      {x:396,y:456,w:16,h:32,label:'O',pts:400,color:'#ff44cc',hit:false,flashTimer:0,group:'hole'},
-      {x:396,y:492,w:16,h:32,label:'L',pts:400,color:'#ff44cc',hit:false,flashTimer:0,group:'hole'},
-      {x:396,y:528,w:16,h:32,label:'E',pts:400,color:'#ff44cc',hit:false,flashTimer:0,group:'hole'},
-    ]},
-  ];
-
-  const targets=[
-    // Orbit completion targets at ramp exits
-    {x:80, y:95, w:20,h:14,label:'◀',pts:800,color:'#44ffff',hit:false,flashTimer:0,group:'orbit_l'},
-    {x:380,y:95, w:20,h:14,label:'▶',pts:800,color:'#44ffff',hit:false,flashTimer:0,group:'orbit_r'},
-    // Multiplier standup targets
-    {x:195,y:445,w:16,h:28,label:'2×',pts:1000,color:'#ffaa00',hit:false,flashTimer:0,group:'multi'},
-    {x:218,y:445,w:16,h:28,label:'3×',pts:1000,color:'#ffaa00',hit:false,flashTimer:0,group:'multi'},
-    {x:241,y:445,w:16,h:28,label:'5×',pts:1000,color:'#ffaa00',hit:false,flashTimer:0,group:'multi'},
-  ];
-
-  const ramps=[
-    {type:'orbit',side:'left',
-     path:[{x:82,y:660},{x:52,y:480},{x:52,y:280},{x:115,y:155},{x:195,y:115}],
-     exitX:195,exitY:115,exitVx:2.5,exitVy:0.5,z:1,color:'#2244aa',lit:false,litTimer:0,travelMs:850},
-    {type:'orbit',side:'right',
-     path:[{x:398,y:660},{x:428,y:480},{x:428,y:280},{x:365,y:155},{x:285,y:115}],
-     exitX:285,exitY:115,exitVx:-2.5,exitVy:0.5,z:1,color:'#6622aa',lit:false,litTimer:0,travelMs:850},
-    {type:'loop',
-     path:[{x:200,y:380},{x:200,y:280},{x:280,y:280},{x:280,y:380}],
-     exitX:280,exitY:385,exitVx:1.5,exitVy:2,z:1,color:'#884400',lit:false,litTimer:0,travelMs:700},
-  ];
-
-  const wormHoles=[
-    {x:240,y:710,r:24,active:false,color:'#4400ff',label:'ENTRANCE',hits:0},
-    {x:130,y:255,r:20,active:false,color:'#8800ff',label:'EXIT A',  hits:0},
-    {x:350,y:255,r:20,active:false,color:'#cc00ff',label:'EXIT B',  hits:0},
-    {x:240,y:155,r:18,active:false,color:'#ff00cc',label:'SINGULARITY',hits:0},
-  ];
-
-  const locks=[
-    {x:240,y:570,r:18,locked:false,color:'#00ccff',label:'LOCK'},
-  ];
-
-  const kickers=[
-    {x:240,y:95,r:16,vx:0,vy:-10,pts:500,color:'#00ffff',label:'SHOOTER'},
-  ];
-
-  const lights=buildStarLights();
-
-  const arrows=[
-    {x:100,y:640,angle:-0.4,color:'#4488ff',lit:false,label:'ORBIT'},
-    {x:380,y:640,angle:Math.PI+0.4,color:'#4488ff',lit:false,label:'ORBIT'},
-    {x:195,y:410,angle:-Math.PI/2,color:'#ffaa00',lit:false,label:'MULTI'},
-    {x:240,y:680,angle:-Math.PI/2,color:'#8800ff',lit:false,label:'WORM'},
-  ];
-
-  return {
-    id:'worm_holer',
-    flippers,bumpers,slings,targets,dropBanks,ramps,wormHoles,locks,kickers,lights,arrows,
-    wallColor:'#06061a',railColor:'#0022aa',fieldColor:'#00000c',
-    inlaneColor:'#001166',slingsColor:'#0033cc',
-    drawBg: drawWHBg,
-    logic: whLogic,
-    onBumper: whOnBumper,
-    onGroup: whOnGroup,
-  };
-}
-
-function buildStarLights(){
-  const l=[];
-  for(let i=0;i<35;i++){
-    l.push({x:60+Math.random()*360,y:80+Math.random()*700,
-      r:1+Math.random()*2.5,color:['#fff','#aaccff','#ffaacc','#ccaaff'][i%4],
-      phase:Math.random()*Math.PI*2,speed:0.015+Math.random()*0.04,type:'star'});
-  }
-  // Inlane indicator lights
-  [680,710,740].forEach((y,i)=>{
-    l.push({x:82,y,r:6,color:'#4488ff',phase:i*0.8,speed:0.04,type:'inlane'});
-    l.push({x:398,y,r:6,color:'#4488ff',phase:i*0.8,speed:0.04,type:'inlane'});
-  });
-  return l;
-}
-
-function whLogic(dt){
-  // Gravity wells toward active worm holes
-  _pb.wormHoles.filter(w=>w.active).forEach(w=>{
-    [_pb.ball,..._pb.extras].forEach(b=>{
-      if(!b.active||b.lost)return;
-      const dx=w.x-b.x,dy=w.y-b.y,d=Math.hypot(dx,dy);
-      if(d<130&&d>w.r+PB.BALL_R+5){
-        b.vx+=dx/d*0.10*dt; b.vy+=dy/d*0.10*dt;
-      }
-    });
-  });
-}
-
-function whOnBumper(b){
-  _pb.tableProgress.bumps=(_pb.tableProgress.bumps||0)+1;
-  if(_pb.tableProgress.bumps%15===0) startMultiball(1);
-}
-
-function whOnGroup(group){
-  if(group==='worm'||group==='hole'){
-    const wh=_pb.wormHoles.find(w=>!w.active);
-    if(wh){wh.active=true;snd('wormHoleActivate');dmd('WORM HOLE OPEN!','');}
-  }
-  if(group==='multi'){
-    _pb.multiplier=Math.min(_pb.multiplier+1,5);
-    dmd('MULTIPLIER '+_pb.multiplier+'×!','');
-  }
-  if(group==='orbit_l'||group==='orbit_r') triggerMode('orbitMadness',20,'SHOOT ORBITS!');
-}
-
-// ════════════════════════════════════════════════════════
-// BARF'S HOUSE
-// ════════════════════════════════════════════════════════
-function tableBarfsHouse(){
-  const flippers=stdFlippers([
-    // Upper kitchen flipper (left only)
-    {x:120,y:400,angle:-0.38,len:58,w:9,side:'left',active:false,z:0},
-  ]);
-
-  const bumpers=[
-    {x:162,y:195,r:26,label:"BARF!",   pts:100,color:'#cc4400',ring:'#ff8844',hits:0,flashTimer:0,cooldown:0},
-    {x:295,y:172,r:26,label:'SQUAWK!', pts:150,color:'#336600',ring:'#66dd00',hits:0,flashTimer:0,cooldown:0},
-    {x:375,y:225,r:22,label:'CUSTOMER',pts:100,color:'#cc3300',ring:'#ff7744',hits:0,flashTimer:0,cooldown:0},
-    {x:200,y:272,r:20,label:'TABLE 3', pts:200,color:'#774400',ring:'#cc8844',hits:0,flashTimer:0,cooldown:0},
-    {x:328,y:305,r:20,label:'GRILL IT',pts:200,color:'#aa2200',ring:'#ff6644',hits:0,flashTimer:0,cooldown:0},
-    {x:142,y:338,r:20,label:'HEALTH!', pts:300,color:'#dd0044',ring:'#ff5588',hits:0,flashTimer:0,cooldown:0},
-    {x:252,y:148,r:18,label:'SPECIALS!',pts:250,color:'#886600',ring:'#ffcc44',hits:0,flashTimer:0,cooldown:0},
-  ];
-
-  const slings=[
-    {x:58, y:580,w:24,h:90,kickVx:8, kickVy:-4,color:'#ff6600',pts:50},
-    {x:398,y:580,w:24,h:90,kickVx:-8,kickVy:-4,color:'#44aa00',pts:50},
-  ];
-
-  const dropBanks=[
-    {label:'SERVE',targets:[
-      {x:66,y:415,w:16,h:32,label:'S',pts:300,color:'#ff8800',hit:false,flashTimer:0,group:'serve'},
-      {x:66,y:451,w:16,h:32,label:'E',pts:300,color:'#ff8800',hit:false,flashTimer:0,group:'serve'},
-      {x:66,y:487,w:16,h:32,label:'R',pts:300,color:'#ff8800',hit:false,flashTimer:0,group:'serve'},
-      {x:66,y:523,w:16,h:32,label:'V',pts:300,color:'#ff8800',hit:false,flashTimer:0,group:'serve'},
-      {x:66,y:559,w:16,h:32,label:'E',pts:300,color:'#ff8800',hit:false,flashTimer:0,group:'serve'},
-    ]},
-    {label:'CHIKN',targets:[
-      {x:398,y:415,w:16,h:32,label:'C',pts:400,color:'#44cc00',hit:false,flashTimer:0,group:'chicken'},
-      {x:398,y:451,w:16,h:32,label:'H',pts:400,color:'#44cc00',hit:false,flashTimer:0,group:'chicken'},
-      {x:398,y:487,w:16,h:32,label:'I',pts:400,color:'#44cc00',hit:false,flashTimer:0,group:'chicken'},
-      {x:398,y:523,w:16,h:32,label:'C',pts:400,color:'#44cc00',hit:false,flashTimer:0,group:'chicken'},
-      {x:398,y:559,w:16,h:32,label:'K',pts:400,color:'#44cc00',hit:false,flashTimer:0,group:'chicken'},
-    ]},
-  ];
-
-  const targets=[
-    {x:170,y:430,w:16,h:30,label:'⭐',pts:1000,color:'#ffdd00',hit:false,flashTimer:0,group:'stars'},
-    {x:192,y:430,w:16,h:30,label:'⭐',pts:1000,color:'#ffdd00',hit:false,flashTimer:0,group:'stars'},
-    {x:214,y:430,w:16,h:30,label:'⭐',pts:1000,color:'#ffdd00',hit:false,flashTimer:0,group:'stars'},
-    // Kitchen standup targets
-    {x:155,y:330,w:14,h:24,label:'KIT',pts:600,color:'#ffaa00',hit:false,flashTimer:0,group:'kitchen'},
-    {x:305,y:335,w:14,h:24,label:'CHN',pts:600,color:'#ffaa00',hit:false,flashTimer:0,group:'kitchen'},
-    {x:230,y:95, w:20,h:14,label:'🍗', pts:2000,color:'#ffcc00',hit:false,flashTimer:0,group:'jackpot'},
-  ];
-
-  const ramps=[
-    {type:'orbit',side:'left',
-     path:[{x:82,y:650},{x:54,y:470},{x:60,y:295},{x:130,y:170}],
-     exitX:130,exitY:170,exitVx:3.5,exitVy:0,z:1,color:'#664400',lit:false,litTimer:0,travelMs:800,label:'KITCHEN!'},
-    {type:'orbit',side:'right',
-     path:[{x:398,y:650},{x:426,y:470},{x:420,y:295},{x:350,y:170}],
-     exitX:350,exitY:170,exitVx:-3.5,exitVy:0,z:1,color:'#446600',lit:false,litTimer:0,travelMs:800,label:'ORDER UP!'},
-  ];
-
-  const locks=[
-    {x:240,y:560,r:20,locked:false,color:'#ff8800',label:'APRON SAVE'},
-  ];
-
-  const kickers=[
-    // Ball popper behind the bar
-    {x:240,y:108,r:18,vx:0,vy:-9,pts:2000,color:'#ffcc00',label:'BAR SHOT'},
-  ];
-
-  const wormHoles=[];
-
-  const lights=buildNeonLights();
-  const arrows=[
-    {x:95,y:630,angle:-0.35,color:'#ff8800',lit:false,label:'KITCHEN'},
-    {x:385,y:630,angle:Math.PI+0.35,color:'#44cc00',lit:false,label:'ORDER'},
-    {x:232,y:508,angle:-Math.PI/2,color:'#ffdd00',lit:false,label:'STARS'},
-  ];
-
-  return {
-    id:'barfs_house',
-    flippers,bumpers,slings,targets,dropBanks,ramps,wormHoles,locks,kickers,lights,arrows,
-    wallColor:'#1a0800',railColor:'#aa5500',fieldColor:'#090400',
-    inlaneColor:'#662200',slingsColor:'#993300',
-    drawBg: drawBHBg,
-    logic: bhLogic,
-    onBumper: bhOnBumper,
-    onGroup: bhOnGroup,
-  };
-}
-
-function buildNeonLights(){
-  const l=[];
-  const cols=['#ff6600','#ffdd00','#ff4400','#44ff00','#ff0044'];
-  for(let i=0;i<28;i++){
-    l.push({x:70+Math.random()*340,y:100+Math.random()*630,
-      r:3+Math.random()*4,color:cols[i%5],
-      phase:Math.random()*Math.PI*2,speed:0.03+Math.random()*0.06,type:'neon'});
-  }
-  [670,700,730].forEach((y,i)=>{
-    l.push({x:84,y,r:6,color:'#ff8800',phase:i*0.7,speed:0.05,type:'inlane'});
-    l.push({x:396,y,r:6,color:'#44cc00',phase:i*0.7,speed:0.05,type:'inlane'});
-  });
-  return l;
-}
-
-function bhLogic(dt){
-  // Laugh track dots flash on combos
-  if(_pb.combo>3){
-    if(Math.floor(_pb.phaseTimer*6)%2===0){
-      _pb.strobes.push({x:PB.W/2,y:72,r:200,life:0.05,max:0.05,color:'rgba(255,220,100,0.06)'});
-    }
-  }
-}
-function bhOnBumper(b){
-  _pb.tableProgress.orders=(_pb.tableProgress.orders||0)+1;
-  if(_pb.tableProgress.orders%12===0) startMultiball(1);
-}
-function bhOnGroup(group){
-  if(group==='serve') triggerMode('servingTime',22,'SERVE CHICKEN!');
-  if(group==='chicken') triggerMode('kitchenChaos',30,'KITCHEN CHAOS!');
-  if(group==='stars'){_pb.multiplier=Math.min(_pb.multiplier+1,5);dmd('SATISFACTION +1!','');}
-  if(group==='kitchen') triggerMode('healthInspector',15,'HEALTH INSPECTION!');
-  if(group==='jackpot'){addPts(20000*_pb.multiplier,PB.W/2,100);dmd("BARF'S SPECIAL!",'JACKPOT!');}
-}
-
-// ════════════════════════════════════════════════════════
-// SHOWER DEFENSE
-// ════════════════════════════════════════════════════════
-function tableShowerDefense(){
-  const flippers=stdFlippers([
-    // Side tub flipper (right side, points up)
-    {x:432,y:480,angle:-Math.PI*0.55,len:54,w:9,side:'right',active:false,z:0,sideFlipper:true},
-  ]);
-
-  const bumpers=[
-    {x:162,y:195,r:26,label:'SOAP',   pts:100,color:'#aaddff',ring:'#ddeeff',hits:0,flashTimer:0,cooldown:0},
-    {x:300,y:172,r:26,label:'DUCK!',  pts:150,color:'#ffdd00',ring:'#ffe880',hits:0,flashTimer:0,cooldown:0},
-    {x:378,y:222,r:22,label:'LOOFAH', pts:100,color:'#ff88aa',ring:'#ffbbcc',hits:0,flashTimer:0,cooldown:0},
-    {x:200,y:272,r:20,label:'PLUNGE', pts:200,color:'#6688ff',ring:'#aabbff',hits:0,flashTimer:0,cooldown:0},
-    {x:328,y:302,r:20,label:'SCRUB',  pts:200,color:'#44ccff',ring:'#88ddff',hits:0,flashTimer:0,cooldown:0},
-    {x:145,y:338,r:20,label:'RINSE',  pts:300,color:'#00ccff',ring:'#66ddff',hits:0,flashTimer:0,cooldown:0},
-    {x:252,y:148,r:18,label:'SPONGE', pts:250,color:'#ffcc88',ring:'#ffddb0',hits:0,flashTimer:0,cooldown:0},
-  ];
-
-  const slings=[
-    {x:56, y:570,w:24,h:90,kickVx:8, kickVy:-4.5,color:'#0088ff',pts:50},
-    {x:400,y:570,w:24,h:90,kickVx:-8,kickVy:-4.5,color:'#00ccff',pts:50},
-  ];
-
-  const dropBanks=[
-    {label:'DRAIN',targets:[
-      {x:66,y:410,w:16,h:32,label:'D',pts:300,color:'#0088ff',hit:false,flashTimer:0,group:'drain'},
-      {x:66,y:446,w:16,h:32,label:'R',pts:300,color:'#0088ff',hit:false,flashTimer:0,group:'drain'},
-      {x:66,y:482,w:16,h:32,label:'A',pts:300,color:'#0088ff',hit:false,flashTimer:0,group:'drain'},
-      {x:66,y:518,w:16,h:32,label:'I',pts:300,color:'#0088ff',hit:false,flashTimer:0,group:'drain'},
-      {x:66,y:554,w:16,h:32,label:'N',pts:300,color:'#0088ff',hit:false,flashTimer:0,group:'drain'},
-    ]},
-    {label:'CLEAN',targets:[
-      {x:398,y:410,w:16,h:32,label:'C',pts:400,color:'#00ccff',hit:false,flashTimer:0,group:'clean'},
-      {x:398,y:446,w:16,h:32,label:'L',pts:400,color:'#00ccff',hit:false,flashTimer:0,group:'clean'},
-      {x:398,y:482,w:16,h:32,label:'E',pts:400,color:'#00ccff',hit:false,flashTimer:0,group:'clean'},
-      {x:398,y:518,w:16,h:32,label:'A',pts:400,color:'#00ccff',hit:false,flashTimer:0,group:'clean'},
-      {x:398,y:554,w:16,h:32,label:'N',pts:400,color:'#00ccff',hit:false,flashTimer:0,group:'clean'},
-    ]},
-  ];
-
-  const targets=[
-    // Water drop bonus targets
-    {x:170,y:440,w:16,h:28,label:'💧',pts:800,color:'#44aaff',hit:false,flashTimer:0,group:'drops'},
-    {x:192,y:440,w:16,h:28,label:'💧',pts:800,color:'#44aaff',hit:false,flashTimer:0,group:'drops'},
-    {x:214,y:440,w:16,h:28,label:'💧',pts:800,color:'#44aaff',hit:false,flashTimer:0,group:'drops'},
-    {x:236,y:440,w:16,h:28,label:'💧',pts:800,color:'#44aaff',hit:false,flashTimer:0,group:'drops'},
-    // Skill shot
-    {x:220,y:95, w:20,h:14,label:'🚿',pts:3000,color:'#00ffcc',hit:false,flashTimer:0,group:'skillshot'},
-    // Soap scum boss targets
-    {x:153,y:355,w:14,h:24,label:'SCM',pts:500,color:'#88aa66',hit:false,flashTimer:0,group:'scum'},
-    {x:315,y:360,w:14,h:24,label:'SCM',pts:500,color:'#88aa66',hit:false,flashTimer:0,group:'scum'},
-  ];
-
-  const ramps=[
-    {type:'orbit',side:'left',
-     path:[{x:82,y:648},{x:54,y:465},{x:58,y:265},{x:138,y:155}],
-     exitX:138,exitY:155,exitVx:2.8,exitVy:0.3,z:1,color:'#005588',lit:false,litTimer:0,travelMs:820,label:'SHOWER'},
-    {type:'loop',side:'right',
-     path:[{x:398,y:648},{x:426,y:465},{x:422,y:265},{x:342,y:155}],
-     exitX:342,exitY:155,exitVx:-2.8,exitVy:0.3,z:1,color:'#006688',lit:false,litTimer:0,travelMs:820,label:'TUB LOOP'},
-    // Center shower head loop
-    {type:'center',
-     path:[{x:205,y:375},{x:205,y:270},{x:275,y:270},{x:275,y:375}],
-     exitX:275,exitY:380,exitVx:1.5,exitVy:2.5,z:1,color:'#004466',lit:false,litTimer:0,travelMs:650,label:'DRAIN LOOP'},
-  ];
-
-  const locks=[
-    {x:240,y:552,r:20,locked:false,color:'#00ccff',label:'DRAIN LOCK'},
-  ];
-
-  const kickers=[
-    {x:240,y:105,r:16,vx:0,vy:-9,pts:1500,color:'#00ffcc',label:'SHOWER HEAD'},
-  ];
-
-  const wormHoles=[];
-
-  const lights=buildWaterLights();
-  const arrows=[
-    {x:96,y:628,angle:-0.38,color:'#0088ff',lit:false,label:'SHOWER'},
-    {x:384,y:628,angle:Math.PI+0.38,color:'#00ccff',lit:false,label:'TUB'},
-    {x:220,y:420,angle:-Math.PI/2,color:'#44aaff',lit:false,label:'DROPS'},
-    {x:240,y:530,angle:-Math.PI/2,color:'#00ffcc',lit:false,label:'LOCK'},
-  ];
-
-  return {
-    id:'shower_defense',
-    flippers,bumpers,slings,targets,dropBanks,ramps,wormHoles,locks,kickers,lights,arrows,
-    wallColor:'#001820',railColor:'#005588',fieldColor:'#000e16',
-    inlaneColor:'#003366',slingsColor:'#005599',
-    drawBg: drawSDBg,
-    logic: sdLogic,
-    onBumper: sdOnBumper,
-    onGroup: sdOnGroup,
-  };
-}
-
-function buildWaterLights(){
-  const l=[];
-  for(let i=0;i<28;i++){
-    l.push({x:65+Math.random()*350,y:100+Math.random()*650,
-      r:2+Math.random()*3,color:['#aaddff','#44ccff','#00aaff','#66ddff'][i%4],
-      phase:Math.random()*Math.PI*2,speed:0.02+Math.random()*0.04,type:'water'});
-  }
-  [670,700,730].forEach((y,i)=>{
-    l.push({x:84,y,r:6,color:'#0088ff',phase:i*0.8,speed:0.04,type:'inlane'});
-    l.push({x:396,y,r:6,color:'#00ccff',phase:i*0.8,speed:0.04,type:'inlane'});
-  });
-  return l;
-}
-
-function sdLogic(dt){
-  // Grime meter builds slowly
-  if(_pb.phase==='play'){
-    _pb.tableProgress.grime=Math.min(100,(_pb.tableProgress.grime||0)+0.008*dt);
-  }
-  // Current in shower zone — rightward drift
-  if(_pb.ball.active&&_pb.ball.y<PB.H*0.38){
-    _pb.ball.vx+=0.035*dt;
-  }
-}
-function sdOnBumper(b){
-  _pb.tableProgress.grime=Math.max(0,(_pb.tableProgress.grime||0)-2);
-}
-function sdOnGroup(group){
-  if(group==='drain') triggerMode('unclogDrain',22,'SHOOT THE RAMP!');
-  if(group==='clean'){triggerMode('deepClean',25,'DEEP CLEAN MODE!');_pb.tableProgress.grime=0;}
-  if(group==='drops') startMultiball(2);
-  if(group==='scum'){addPts(10000*_pb.multiplier,PB.W/2,300);dmd('SCUM BOSS DEFEATED!','');}
-  if(group==='skillshot'){addPts(5000*_pb.multiplier,PB.W/2,95);dmd('SKILL SHOT!','NICE AIM!');}
-}
-
-// ─── DRAW ─────────────────────────────────────────────────────────────────────
-function draw(){
-  if(!_ctx||!_table)return;
-  const ctx=_ctx;
-  ctx.clearRect(0,0,PB.W,PB.H);
-  drawField(ctx);
-  _table.drawBg(ctx);
-  drawLights(ctx);
-  drawSlingshots(ctx);
-  drawRamps(ctx);
-  drawDropBanks(ctx);
-  drawBumpers(ctx);
-  drawTargets(ctx);
-  drawWHOnField(ctx);
-  drawLocks(ctx);
-  drawKickers(ctx);
-  drawArrows(ctx);
-  drawFlippers(ctx);
-  drawPlunger(ctx);
-  drawStrobes(ctx);
-  [_pb.ball,..._pb.extras].forEach(b=>drawBall(ctx,b));
-  drawPulses(ctx);
-  drawHUD(ctx);
-}
-
-function drawField(ctx){
-  const t=_table;
-  ctx.fillStyle=t.fieldColor||'#000008';
-  ctx.fillRect(0,0,PB.W,PB.H);
-  // Side walls
-  ctx.fillStyle=t.wallColor||'#06061a';
-  ctx.fillRect(0,0,wallL,PB.H); ctx.fillRect(wallR,0,PB.W-wallR,PB.H);
-  // Rail
-  ctx.fillStyle=t.railColor||'#0022aa';
-  ctx.fillRect(wallL-4,0,4,PB.H); ctx.fillRect(wallR,0,4,PB.H);
-  // Inlane guide lines (upper section only — below this is open gutter)
-  ctx.strokeStyle=t.inlaneColor||'#001166';
-  ctx.lineWidth=3;
-  ctx.beginPath();ctx.moveTo(inlaneL,FL.y-30);ctx.lineTo(inlaneL,FL.y-220);ctx.stroke();
-  ctx.beginPath();ctx.moveTo(inlaneR,FL.y-30);ctx.lineTo(inlaneR,FL.y-220);ctx.stroke();
-
-  // Bottom section: angled guide rails from wall to flipper pivot area
-  // These are the slanted walls that funnel ball toward flippers
-  ctx.strokeStyle=t.railColor||'#0022aa';
-  ctx.lineWidth=5; ctx.lineCap='round';
-  // Left guide rail: from wallL down to just left of left pivot
-  ctx.beginPath();
-  ctx.moveTo(inlaneL, FL.y - 30);
-  ctx.lineTo(wallL+2, FL.y + 40);
-  ctx.stroke();
-  // Right guide rail
-  ctx.beginPath();
-  ctx.moveTo(inlaneR, FL.y - 30);
-  ctx.lineTo(wallR-2, FL.y + 40);
-  ctx.stroke();
-
-  // Solid drain wall below flippers (ball disappears here)
-  ctx.fillStyle=t.wallColor||'#06061a';
-  ctx.fillRect(0, DRAIN_Y+2, PB.W, PB.H-DRAIN_Y);
-
-  // Center drain slot visual (very subtle)
-  ctx.fillStyle='rgba(255,0,0,0.08)';
-  const tipL = FL.leftX + FL.len*Math.cos(FL.REST_L);
-  const tipR = FL.rightX + FL.len*Math.cos(FL.REST_R);
-  ctx.fillRect(tipL, FL.y+10, tipR-tipL, DRAIN_Y-FL.y-10);
-  // Plunger lane
-  ctx.fillStyle='rgba(255,255,255,0.025)';
-  ctx.fillRect(wallR,PB.H-270,PB.W-wallR,270);
-  // Plunger lane exit arc at TOP — curved guide that routes ball onto playfield
-  // This is the most important visual: player sees where ball will exit
-  ctx.strokeStyle=t.railColor||'#0022aa';
-  ctx.lineWidth=6; ctx.lineCap='round';
-  // Main curved guide: from top of lane wall, sweeps left onto playfield
-  ctx.beginPath();
-  ctx.moveTo(wallR+2, 125);              // top of lane wall
-  ctx.quadraticCurveTo(wallR+2, wallT+8, wallR-55, wallT+8); // curves left along top
-  ctx.stroke();
-  // Bright highlight on the curve so it's clearly visible
-  ctx.strokeStyle='rgba(255,255,255,0.18)';
-  ctx.lineWidth=2;
-  ctx.beginPath();
-  ctx.moveTo(wallR+2, 125);
-  ctx.quadraticCurveTo(wallR+2, wallT+8, wallR-55, wallT+8);
-  ctx.stroke();
-  // Small arrow showing exit direction
-  ctx.fillStyle=t.railColor||'#0022aa';
-  ctx.beginPath();
-  ctx.moveTo(wallR-55, wallT+4);
-  ctx.lineTo(wallR-65, wallT+12);
-  ctx.lineTo(wallR-55, wallT+16);
-  ctx.fill();
-  // Center divider line
-  ctx.strokeStyle='rgba(255,255,255,0.03)';
-  ctx.lineWidth=1; ctx.setLineDash([3,6]);
-  ctx.beginPath();ctx.moveTo(PB.W/2,wallT);ctx.lineTo(PB.W/2,PB.H-200);ctx.stroke();
-  ctx.setLineDash([]);
-}
-
-function drawSlingshots(ctx){
-  _pb.slings.forEach(s=>{
-    ctx.fillStyle=s.color||'#4488ff';
-    ctx.globalAlpha=0.7;
-    // Triangular slingshot shape
-    if(s.kickVx>0){// left side
-      ctx.beginPath();ctx.moveTo(s.x,s.y);ctx.lineTo(s.x+s.w,s.y+s.h*0.5);ctx.lineTo(s.x,s.y+s.h);ctx.fill();
-    } else {// right side
-      ctx.beginPath();ctx.moveTo(s.x+s.w,s.y);ctx.lineTo(s.x,s.y+s.h*0.5);ctx.lineTo(s.x+s.w,s.y+s.h);ctx.fill();
-    }
-    ctx.globalAlpha=1;
-    // Edge highlight
-    ctx.strokeStyle=s.color; ctx.lineWidth=2;
-    ctx.strokeRect(s.x,s.y,s.w,s.h);
-  });
-}
-
-function drawRamps(ctx){
-  _pb.ramps.forEach(r=>{
-    const lit=r.lit;
-    const t=_pb.phaseTimer;
-
-    // 3D shadow underneath ramp (gives height illusion)
-    ctx.globalAlpha=0.35;
-    ctx.strokeStyle='rgba(0,0,0,0.8)';
-    ctx.lineWidth=18; ctx.lineCap='round';
+  // ---- ball lock zone ----
+  if (T.lockZone) {
     ctx.beginPath();
-    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x+3,p.y+5):ctx.lineTo(p.x+3,p.y+5));
-    ctx.stroke();
+    ctx.arc(T.lockZone.x, T.lockZone.y, T.lockZone.r, 0, TAU);
+    ctx.fillStyle = T.lockZone.active ? 'rgba(255,62,165,0.25)' : 'rgba(80,80,110,0.2)';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = T.lockZone.active ? T.colors.neon : '#555';
+    ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#fff'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('LOCK', T.lockZone.x, T.lockZone.y + 3);
+  }
 
-    // Ramp body — wide, colored, shows elevation
-    ctx.globalAlpha=lit?0.88:0.52;
-    ctx.strokeStyle=r.color;
-    ctx.lineWidth=16; ctx.lineCap='round';
+  // ---- rollover lanes ----
+  for (const ln of T.lanes) {
     ctx.beginPath();
-    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
-    ctx.stroke();
+    ctx.arc(ln.x, ln.y, 9, 0, TAU);
+    ctx.fillStyle = ln.lit ? T.colors.neon2 : 'rgba(255,255,255,0.15)';
+    ctx.fill();
+  }
 
-    // Dark edge (bottom of ramp — thickness illusion)
-    ctx.globalAlpha=lit?0.6:0.3;
-    ctx.strokeStyle=dkn(r.color,0.5);
-    ctx.lineWidth=18; ctx.lineCap='round';
-    ctx.lineJoin='round';
-    // Offset slightly down
+  // ---- static colliders ----
+  for (const c of T.staticColliders) drawCollider(ctx, c);
+  for (const p of T.posts) drawCollider(ctx, p);
+
+  // ---- bumpers ----
+  for (const b of T.bumpers) drawBumper(ctx, b, T);
+
+  // ---- targets ----
+  for (const t of T.targets) drawTarget(ctx, t, T);
+
+  // ---- flippers ----
+  for (const fl of T.flippers) drawFlipper(ctx, fl, T);
+
+  // ---- plunger ----
+  drawPlunger(ctx, T);
+
+  // ---- balls (with z-shadow) ----
+  for (const ball of _pb.balls) drawBall(ctx, ball, T);
+
+  // ---- HUD overlays for non-play phases ----
+  if (_pb.phase === 'attract') drawAttractOverlay(ctx, T);
+  if (_pb.phase === 'gameover') drawGameOverOverlay(ctx, T);
+
+  ctx.restore();
+}
+
+function drawCollider(ctx, c) {
+  ctx.strokeStyle = c.color || '#4a3f7a';
+  ctx.lineCap = 'round';
+  if (c.kind === 'seg') {
+    ctx.lineWidth = c.r * 2;
+    if (c.role === 'sling') { ctx.strokeStyle = c.color; ctx.shadowColor = c.color; ctx.shadowBlur = 12; }
     ctx.beginPath();
-    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y+4):ctx.lineTo(p.x,p.y+4));
-    ctx.stroke();
-
-    // Top highlight (light catching ramp surface)
-    ctx.globalAlpha=lit?0.6:0.18;
-    ctx.strokeStyle='rgba(255,255,255,0.9)';
-    ctx.lineWidth=3;
-    ctx.beginPath();
-    r.path.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y-2):ctx.lineTo(p.x,p.y-2));
-    ctx.stroke();
-
-    // Animated travel arrows when lit
-    if(lit){
-      const arrowAnim=Math.floor(t*6)%r.path.length;
-      r.path.forEach((p,i)=>{
-        const active=i===arrowAnim;
-        ctx.globalAlpha=active?1:0.45;
-        ctx.fillStyle=active?'#ffffff':lhn(r.color,0.3);
-        ctx.font=`bold ${active?13:10}px monospace`;
-        ctx.textAlign='center'; ctx.textBaseline='middle';
-        ctx.shadowColor=active?'#fff':'transparent';
-        ctx.shadowBlur=active?8:0;
-        ctx.fillText('▲',p.x,p.y-8);
-        ctx.shadowBlur=0;
-      });
-    }
-
-    ctx.globalAlpha=1;
-
-    // Entry indicator — glowing circle at ramp mouth
-    const ep=r.path[0];
-    ctx.strokeStyle=lit?'#ffffff':r.color;
-    ctx.lineWidth=2;
-    ctx.shadowColor=r.color; ctx.shadowBlur=lit?12:4;
-    ctx.beginPath();ctx.arc(ep.x,ep.y,10,0,Math.PI*2);ctx.stroke();
-    ctx.shadowBlur=0;
-
-    // Label at entry
-    if(r.label){
-      const side=ep.x<PB.W/2;
-      ctx.fillStyle=lit?'#fff':'rgba(200,200,255,0.55)';
-      ctx.font='bold 8px monospace'; ctx.textAlign='center';
-      ctx.shadowColor=r.color; ctx.shadowBlur=lit?6:0;
-      ctx.fillText(r.label,ep.x+(side?22:-22),ep.y-4);
-      ctx.shadowBlur=0;
-    }
-
-    // Exit point marker
-    const ex=r.exitX,ey=r.exitY;
-    ctx.globalAlpha=0.5;
-    ctx.fillStyle=r.color;
-    ctx.beginPath();ctx.arc(ex,ey,5,0,Math.PI*2);ctx.fill();
-    ctx.globalAlpha=1;
-  });
-}
-
-function drawDropBanks(ctx){
-  _pb.dropBanks.forEach(bank=>{
-    bank.targets.forEach(t=>{
-      const flash=t.flashTimer>0;
-      ctx.fillStyle=t.hit?(flash?t.color:'#222'):t.color;
-      ctx.shadowColor=flash?'#fff':t.color;
-      ctx.shadowBlur=flash?15:5;
-      ctx.fillRect(t.x,t.y,t.w,t.h);
-      ctx.shadowBlur=0;
-      ctx.fillStyle=t.hit?'#555':'#fff';
-      ctx.font=`bold ${Math.min(t.w,t.h)*0.65}px monospace`;
-      ctx.textAlign='center'; ctx.textBaseline='middle';
-      ctx.fillText(t.label,t.x+t.w/2,t.y+t.h/2);
-    });
-  });
-}
-
-function drawBumpers(ctx){
-  _pb.bumpers.forEach(b=>{
-    const f=b.flashTimer>0;
-    const pulse=0.5+0.5*Math.sin(_pb.phaseTimer*6);
-    if(f){ctx.shadowColor=b.ring;ctx.shadowBlur=30;}
-    // Outer glow ring
-    ctx.strokeStyle=f?'#ffffff':b.ring;
-    ctx.lineWidth=f?4:2.5;
-    ctx.beginPath();ctx.arc(b.x,b.y,b.r+5+(f?4*pulse:0),0,Math.PI*2);ctx.stroke();
-    ctx.shadowBlur=0;
-    // Body gradient
-    const gr=ctx.createRadialGradient(b.x-b.r*0.3,b.y-b.r*0.35,0,b.x,b.y,b.r);
-    gr.addColorStop(0,f?'#ffffff':lhn(b.color,0.5));
-    gr.addColorStop(0.5,f?b.ring:b.color);
-    gr.addColorStop(1,dkn(b.color,0.4));
-    ctx.fillStyle=gr;
-    ctx.beginPath();ctx.arc(b.x,b.y,b.r,0,Math.PI*2);ctx.fill();
-    // Label
-    ctx.fillStyle=f?'#000':'#fff';
-    ctx.font=`bold ${Math.max(7,Math.floor(b.r*0.48))}px monospace`;
-    ctx.textAlign='center'; ctx.textBaseline='middle';
-    ctx.fillText(b.label,b.x,b.y);
-    // Hit counter
-    if(b.hits>0){
-      ctx.fillStyle='rgba(255,255,255,0.35)';
-      ctx.font='6px monospace';
-      ctx.fillText(b.hits,b.x+b.r*0.65,b.y-b.r*0.65);
-    }
-  });
-}
-
-function drawTargets(ctx){
-  _pb.targets.forEach(t=>{
-    const f=t.flashTimer>0;
-    ctx.fillStyle=t.hit?(f?t.color:'#1a1a1a'):t.color;
-    ctx.shadowColor=f?'#fff':t.color; ctx.shadowBlur=f?12:4;
-    ctx.fillRect(t.x,t.y,t.w,t.h);
-    ctx.shadowBlur=0;
-    ctx.fillStyle=t.hit?'#444':'#fff';
-    ctx.font=`bold ${Math.min(t.w,t.h)*0.68}px monospace`;
-    ctx.textAlign='center'; ctx.textBaseline='middle';
-    ctx.fillText(t.label,t.x+t.w/2,t.y+t.h/2);
-  });
-}
-
-function drawWHOnField(ctx){
-  if(_table.id!=='worm_holer')return;
-  _pb.wormHoles.forEach(w=>{
-    const t=_pb.phaseTimer,spin=t*(w.active?2.5:0.4);
-    for(let i=0;i<(w.active?7:3);i++){
-      const a=spin+i*(Math.PI*2/7);
-      ctx.strokeStyle=w.active
-        ?`hsla(${270+i*18},100%,65%,${0.7-i*0.08})`
-        :`rgba(100,80,180,${0.15-i*0.03})`;
-      ctx.lineWidth=1.8;
-      ctx.beginPath();
-      ctx.arc(w.x,w.y,w.r*(0.3+i*0.1),a,a+Math.PI*(1.5-i*0.15));
-      ctx.stroke();
-    }
-    ctx.fillStyle=w.active?w.color:'#111';
-    ctx.shadowColor=w.active?w.color:'transparent';
-    ctx.shadowBlur=w.active?18:0;
-    ctx.beginPath();ctx.arc(w.x,w.y,w.r*0.38,0,Math.PI*2);ctx.fill();
-    ctx.shadowBlur=0;
-    ctx.fillStyle=w.active?'#fff':'#444';
-    ctx.font='7px monospace'; ctx.textAlign='center'; ctx.textBaseline='bottom';
-    ctx.fillText(w.label,w.x,w.y+w.r+9);
-  });
-}
-
-function drawLocks(ctx){
-  _pb.locks.forEach(lk=>{
-    const t=_pb.phaseTimer;
-    ctx.strokeStyle=lk.locked?'#888':lk.color;
-    ctx.lineWidth=2.5;
-    ctx.shadowColor=lk.locked?'transparent':lk.color;
-    ctx.shadowBlur=lk.locked?0:8+4*Math.sin(t*3);
-    ctx.beginPath();ctx.arc(lk.x,lk.y,lk.r,0,Math.PI*2);ctx.stroke();
-    ctx.shadowBlur=0;
-    ctx.fillStyle=lk.locked?'rgba(255,255,255,0.1)':'rgba(0,0,0,0.3)';
-    ctx.beginPath();ctx.arc(lk.x,lk.y,lk.r,0,Math.PI*2);ctx.fill();
-    ctx.fillStyle=lk.locked?'#888':lk.color;
-    ctx.font='7px monospace'; ctx.textAlign='center'; ctx.textBaseline='middle';
-    ctx.fillText(lk.locked?'LOCKED':lk.label,lk.x,lk.y);
-  });
-}
-
-function drawKickers(ctx){
-  _pb.kickers.forEach(k=>{
-    const t=_pb.phaseTimer;
-    ctx.strokeStyle=k.color; ctx.lineWidth=2.5;
-    ctx.shadowColor=k.color; ctx.shadowBlur=8+3*Math.sin(t*4);
-    ctx.beginPath();ctx.arc(k.x,k.y,k.r,0,Math.PI*2);ctx.stroke();
-    ctx.shadowBlur=0;
-    const gr=ctx.createRadialGradient(k.x,k.y,0,k.x,k.y,k.r);
-    gr.addColorStop(0,'rgba(255,255,255,0.15)'); gr.addColorStop(1,'rgba(0,0,0,0.4)');
-    ctx.fillStyle=gr; ctx.beginPath();ctx.arc(k.x,k.y,k.r,0,Math.PI*2);ctx.fill();
-    ctx.fillStyle=k.color; ctx.font='7px monospace';
-    ctx.textAlign='center'; ctx.textBaseline='bottom';
-    ctx.fillText(k.label,k.x,k.y+k.r+8);
-  });
-}
-
-function drawArrows(ctx){
-  _pb.arrows.forEach(a=>{
-    const lit=a.lit||(_pb.modeActive&&Math.sin(_pb.phaseTimer*5)>0);
-    ctx.fillStyle=lit?a.color:'rgba(100,100,100,0.3)';
-    ctx.shadowColor=lit?a.color:'transparent'; ctx.shadowBlur=lit?8:0;
-    ctx.save();
-    ctx.translate(a.x,a.y); ctx.rotate(a.angle);
-    ctx.beginPath();ctx.moveTo(0,-8);ctx.lineTo(6,6);ctx.lineTo(-6,6);ctx.closePath();
-    ctx.fill(); ctx.shadowBlur=0; ctx.restore();
-    if(a.label&&lit){
-      ctx.fillStyle=a.color; ctx.font='6px monospace';
-      ctx.textAlign='center'; ctx.fillText(a.label,a.x,a.y+14);
-    }
-  });
-}
-
-function drawLights(ctx){
-  _pb.lights.forEach(l=>{
-    const br=0.25+0.35*Math.abs(Math.sin(l.phase));
-    ctx.globalAlpha=br;
-    if(l.type==='inlane'){
-      ctx.fillStyle=l.color;
-      ctx.shadowColor=l.color; ctx.shadowBlur=6;
-      ctx.beginPath();ctx.arc(l.x,l.y,l.r,0,Math.PI*2);ctx.fill();
-      ctx.shadowBlur=0;
-    } else {
-      ctx.fillStyle=l.color;
-      ctx.beginPath();ctx.arc(l.x,l.y,l.r,0,Math.PI*2);ctx.fill();
-    }
-    ctx.globalAlpha=1;
-  });
-}
-
-function drawStrobes(ctx){
-  _pb.strobes.forEach(s=>{
-    const p=s.life/s.max;
-    ctx.globalAlpha=p*0.55;
-    const gr=ctx.createRadialGradient(s.x,s.y,0,s.x,s.y,s.r);
-    gr.addColorStop(0,s.color||'#fff');
-    gr.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=gr;
-    ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,Math.PI*2);ctx.fill();
-    ctx.globalAlpha=1;
-  });
-}
-
-function drawFlippers(ctx){
-  _pb.flippers.forEach(f=>{
-    const a  = flipAngle(f);
-    const tx = f.x + FL.len*Math.cos(a);
-    const ty = f.y + FL.len*Math.sin(a);
-    const ac = _tdef?.accentColor||'#4488ff';
-    // Flipper body
-    ctx.strokeStyle = f.active ? '#ffffff' : ac;
-    ctx.lineWidth   = FL.w;
-    ctx.lineCap     = 'round';
-    ctx.shadowColor = f.active ? '#ffffff' : ac;
-    ctx.shadowBlur  = f.active ? 18 : 6;
-    ctx.beginPath();
-    ctx.moveTo(f.x, f.y);
-    ctx.lineTo(tx, ty);
+    ctx.moveTo(c.a.x, c.a.y);
+    ctx.lineTo(c.b.x, c.b.y);
     ctx.stroke();
     ctx.shadowBlur = 0;
-    // Pivot circle
-    ctx.fillStyle  = '#ccc';
-    ctx.strokeStyle= f.active ? '#fff' : ac;
-    ctx.lineWidth  = 2;
-    ctx.beginPath();
-    ctx.arc(f.x, f.y, FL.w/2+3, 0, Math.PI*2);
-    ctx.fill();
-    ctx.stroke();
-    // Tip circle
-    ctx.fillStyle = f.active ? '#fff' : lhn(ac,0.3);
-    ctx.beginPath();
-    ctx.arc(tx, ty, FL.w/2, 0, Math.PI*2);
-    ctx.fill();
-  });
-}
-
-function drawPlunger(ctx){
-  if(_pb.phase!=='plunge')return;
-  const px=PB.W-26, laneBot=PB.H-90, laneTop=90;
-  const laneH=laneBot-laneTop;
-  const charge=_pb.plungerCharge/PB.PLUNGER_MAX;
-  const springH=charge*laneH*0.6;
-  const springY=laneBot-springH;
-  const ballY=springY-9-PB.BALL_R; // ball center above plunger head
-
-  // Lane track (full height guide rail)
-  ctx.strokeStyle='#1a1a1a';ctx.lineWidth=8;ctx.lineCap='round';
-  ctx.beginPath();ctx.moveTo(px,laneTop);ctx.lineTo(px,laneBot);ctx.stroke();
-
-  // Spring coil visual (below plunger head)
-  ctx.strokeStyle='#333';ctx.lineWidth=3;
-  for(let sy=springY+12;sy<laneBot-8;sy+=10){
-    ctx.beginPath();ctx.moveTo(px-5,sy);ctx.lineTo(px+5,sy+5);ctx.stroke();
-  }
-
-  // Spring compression bar (power indicator)
-  const col=charge<0.4?'#44ff88':charge<0.75?'#ffcc00':'#ff4400';
-  ctx.strokeStyle=col;ctx.lineWidth=6;
-  ctx.shadowColor=col;ctx.shadowBlur=12;
-  ctx.beginPath();ctx.moveTo(px,laneBot);ctx.lineTo(px,springY);ctx.stroke();
-  ctx.shadowBlur=0;
-
-  // Plunger head disk
-  ctx.fillStyle='#cccccc';ctx.strokeStyle=col;ctx.lineWidth=2.5;
-  ctx.shadowColor=col;ctx.shadowBlur=8;
-  ctx.beginPath();ctx.arc(px,springY,9,0,Math.PI*2);ctx.fill();ctx.stroke();
-  ctx.shadowBlur=0;
-
-  // Ball sitting ON the plunger head — moves with it
-  // (ball.y is set in updatePlunge, we just draw it here visually)
-  const bc=_tdef?.ballColor||'#c0e0ff';
-  const gr=ctx.createRadialGradient(px-3,ballY-3,0,px,ballY,PB.BALL_R);
-  gr.addColorStop(0,'#fff');gr.addColorStop(0.35,bc);gr.addColorStop(1,dkn(bc,0.5));
-  ctx.fillStyle=gr;ctx.shadowColor=bc;ctx.shadowBlur=10;
-  ctx.beginPath();ctx.arc(px,ballY,PB.BALL_R,0,Math.PI*2);ctx.fill();
-  ctx.shadowBlur=0;
-  // Ball specular
-  ctx.fillStyle='rgba(255,255,255,0.6)';
-  ctx.beginPath();ctx.arc(px-3,ballY-3,PB.BALL_R*0.28,0,Math.PI*2);ctx.fill();
-
-  // Hint text below plunger
-  if(charge<0.05){
-    ctx.fillStyle='rgba(255,255,255,0.35)';ctx.font='8px monospace';ctx.textAlign='center';
-    ctx.fillText('HOLD LAUNCH',px,laneBot+14);
   } else {
-    ctx.fillStyle=col;ctx.font='bold 9px monospace';ctx.textAlign='center';
-    ctx.shadowColor=col;ctx.shadowBlur=6;
-    ctx.fillText('RELEASE!',px,laneBot+14);
-    ctx.shadowBlur=0;
+    ctx.beginPath();
+    ctx.arc(c.c.x, c.c.y, c.r, 0, TAU);
+    ctx.fillStyle = c.color || '#4a3f7a';
+    ctx.fill();
   }
 }
 
-function drawBall(ctx,b){
-  if(!b.active||b.lost)return;
-  const alpha=b.z>0?0.5:1;
-  const r=PB.BALL_R*(1+b.z*0.1);
-  ctx.globalAlpha=alpha;
-  if(b.z>0){
-    ctx.fillStyle='rgba(0,0,0,0.4)';
-    ctx.beginPath();ctx.ellipse(b.x+b.z*4,b.y+b.z*6,r*0.85,r*0.45,0,0,Math.PI*2);ctx.fill();
-  }
-  const bc=_tdef?.ballColor||'#c0e0ff';
-  const gr=ctx.createRadialGradient(b.x-r*0.3,b.y-r*0.3,0,b.x,b.y,r);
-  gr.addColorStop(0,'#ffffff');gr.addColorStop(0.3,bc);gr.addColorStop(1,dkn(bc,0.5));
-  ctx.fillStyle=gr;ctx.shadowColor=bc;ctx.shadowBlur=10;
-  ctx.beginPath();ctx.arc(b.x,b.y,r,0,Math.PI*2);ctx.fill();
-  ctx.shadowBlur=0;
-  ctx.fillStyle='rgba(255,255,255,0.6)';
-  ctx.beginPath();ctx.arc(b.x-r*0.3,b.y-r*0.32,r*0.27,0,Math.PI*2);ctx.fill();
-  ctx.globalAlpha=1;
-}
-
-function drawPulses(ctx){
-  _pb.pulses.forEach(p=>{
-    const pct=p.life/p.max;
-    if(p.type==='score'){
-      ctx.globalAlpha=pct;
-      ctx.fillStyle='#ffdd00';
-      ctx.font=`bold ${11+(1-pct)*8}px monospace`;
-      ctx.textAlign='center';
-      ctx.fillText('+'+p.pts.toLocaleString(),p.x,p.y-(1-pct)*38);
-      ctx.globalAlpha=1;
-    } else if(p.type==='ring'){
-      ctx.globalAlpha=pct*0.7;
-      ctx.strokeStyle=p.color||'#fff';ctx.lineWidth=3;
-      ctx.shadowColor=p.color;ctx.shadowBlur=10;
-      ctx.beginPath();ctx.arc(p.x,p.y,p.r+(1-pct)*24,0,Math.PI*2);ctx.stroke();
-      ctx.shadowBlur=0;ctx.globalAlpha=1;
-    } else if(p.type==='fill'){
-      ctx.globalAlpha=pct*0.8;
-      ctx.fillStyle=p.color||'#fff';
-      ctx.beginPath();ctx.arc(p.x,p.y,p.r+(1-pct)*15,0,Math.PI*2);ctx.fill();
-      ctx.globalAlpha=1;
+function drawRamp(ctx, ramp) {
+  // draw the channel as a thick translucent stroke; brightness scales with
+  // height so the ramp visually "rises".
+  ctx.save();
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  // shadow of the ramp on the playfield (offset down-right by max height)
+  ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+  ctx.lineWidth = ramp.width;
+  ctx.beginPath();
+  ctx.moveTo(ramp.path[0].x + ramp.h1 * 0.12, ramp.path[0].y + ramp.h1 * 0.12);
+  for (let i = 1; i < ramp.path.length; i++)
+    ctx.lineTo(ramp.path[i].x + ramp.h1 * 0.12, ramp.path[i].y + ramp.h1 * 0.12);
+  ctx.stroke();
+  // ramp surface — gradient along its length to suggest the climb
+  const grad = ctx.createLinearGradient(ramp.path[0].x, ramp.path[0].y,
+    ramp.path[ramp.path.length-1].x, ramp.path[ramp.path.length-1].y);
+  grad.addColorStop(0, 'rgba(255,255,255,0.05)');
+  grad.addColorStop(1, hexA(ramp.color, 0.35));
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = ramp.width;
+  ctx.beginPath();
+  ctx.moveTo(ramp.path[0].x, ramp.path[0].y);
+  for (let i = 1; i < ramp.path.length; i++) ctx.lineTo(ramp.path[i].x, ramp.path[i].y);
+  ctx.stroke();
+  // glowing rails
+  ctx.strokeStyle = ramp.color;
+  ctx.shadowColor = ramp.color; ctx.shadowBlur = 8;
+  ctx.lineWidth = 3;
+  for (const sign of [1, -1]) {
+    ctx.beginPath();
+    const hw = ramp.width / 2;
+    for (let i = 0; i < ramp.path.length; i++) {
+      const p0 = ramp.path[Math.max(0, i-1)], p1 = ramp.path[Math.min(ramp.path.length-1, i+1)];
+      let nx = -(p1.y - p0.y), ny = (p1.x - p0.x);
+      const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+      const px = ramp.path[i].x + nx * hw * sign;
+      const py = ramp.path[i].y + ny * hw * sign;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
     }
-  });
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+  // entry arrow marker
+  const e = ramp.path[0];
+  ctx.fillStyle = ramp.color;
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(_pb.tick * 0.1);
+  ctx.beginPath();
+  ctx.arc(e.x, e.y, 6, 0, TAU);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
-function drawHUD(ctx){
-  // Top bar
-  ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(0,0,PB.W,20);
-  ctx.fillStyle=_tdef?.accentColor||'#ffdd00';
-  ctx.font='bold 11px monospace';ctx.textAlign='left';
-  ctx.fillText(_tdef?.name||'PINBALL',50,14);
-  ctx.textAlign='right';ctx.fillStyle='#ffdd00';
-  ctx.fillText(_pb.score.toLocaleString(),PB.W-50,14);
-  ctx.textAlign='center';ctx.fillStyle='#888';ctx.font='10px monospace';
-  ctx.fillText('BALL '+_pb.ballNum+'/3',PB.W/2,14);
-  if(_pb.multiplier>1){
-    ctx.fillStyle='#ff8800';ctx.font='bold 9px monospace';ctx.textAlign='left';
-    ctx.fillText(_pb.multiplier+'×',50,26);
+function drawWormHole(ctx, wh) {
+  ctx.save();
+  const pulse = 0.6 + 0.4 * Math.sin(_pb.tick * 0.08 + wh.idx);
+  if (wh.active) {
+    // swirling vortex
+    for (let r = wh.r + 12; r > 3; r -= 4) {
+      ctx.beginPath();
+      ctx.arc(wh.x, wh.y, r, wh.swirl + r * 0.3, wh.swirl + r * 0.3 + Math.PI * 1.3);
+      ctx.strokeStyle = hexA('#39d7ff', 0.15 + (1 - r / (wh.r + 12)) * 0.6);
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(wh.x, wh.y, wh.r * 0.5, 0, TAU);
+    ctx.fillStyle = '#000';
+    ctx.fill();
+    ctx.shadowColor = '#39d7ff'; ctx.shadowBlur = 18;
+    ctx.beginPath();
+    ctx.arc(wh.x, wh.y, wh.r, 0, TAU);
+    ctx.strokeStyle = '#39d7ff'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.shadowBlur = 0;
+  } else {
+    // dormant — faint ring
+    ctx.beginPath();
+    ctx.arc(wh.x, wh.y, wh.r, 0, TAU);
+    ctx.strokeStyle = hexA('#5b4b9e', 0.4 + pulse * 0.2);
+    ctx.lineWidth = 2;
+    ctx.setLineDash([3, 5]); ctx.stroke(); ctx.setLineDash([]);
   }
-  // Mode bar
-  if(_pb.modeActive&&_pb.modeTimer>0){
-    const pct=_pb.modeTimer/30;
-    ctx.fillStyle='rgba(255,80,0,0.22)';ctx.fillRect(wallL,PB.H-16,pct*(wallR-wallL),8);
-    ctx.strokeStyle='#ff6600';ctx.lineWidth=1;ctx.strokeRect(wallL,PB.H-16,wallR-wallL,8);
+  ctx.restore();
+}
+
+function drawBumper(ctx, b, T) {
+  ctx.save();
+  const flash = b.flash / 12;
+  // base ring
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, b.r + 4, 0, TAU);
+  ctx.fillStyle = hexA(T.colors.neon, 0.2);
+  ctx.fill();
+  // body
+  const g = ctx.createRadialGradient(b.x - 6, b.y - 6, 2, b.x, b.y, b.r);
+  g.addColorStop(0, flash > 0 ? '#fff' : '#ffd6f0');
+  g.addColorStop(1, T.colors.neon);
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, b.r, 0, TAU);
+  ctx.fillStyle = g;
+  if (flash > 0) { ctx.shadowColor = '#fff'; ctx.shadowBlur = 20 * flash; }
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  // cap
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, b.r * 0.45, 0, TAU);
+  ctx.fillStyle = flash > 0 ? '#fff' : '#fff8';
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawTarget(ctx, t, T) {
+  ctx.save();
+  const flash = t.flash / 18;
+  const col = t.hit ? '#3a3a55' : (flash > 0 ? '#fff' : T.colors.neon2);
+  ctx.fillStyle = col;
+  if (flash > 0) { ctx.shadowColor = '#fff'; ctx.shadowBlur = 14 * flash; }
+  ctx.fillRect(t.x - t.w/2, t.y - t.h/2, t.w, t.h);
+  ctx.shadowBlur = 0;
+  // letter
+  ctx.fillStyle = t.hit ? '#888' : '#0a0a1f';
+  ctx.font = 'bold 16px monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(t.letter, t.x, t.y + 1);
+  ctx.restore();
+}
+
+function drawFlipper(ctx, fl, T) {
+  const tip = flipperTip(fl);
+  ctx.save();
+  ctx.lineCap = 'round';
+  // shadow
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = fl.r * 2;
+  ctx.beginPath();
+  ctx.moveTo(fl.px + 3, fl.py + 4);
+  ctx.lineTo(tip.x + 3, tip.y + 4);
+  ctx.stroke();
+  // body
+  const g = ctx.createLinearGradient(fl.px, fl.py, tip.x, tip.y);
+  g.addColorStop(0, '#fff');
+  g.addColorStop(1, T.colors.neon);
+  ctx.strokeStyle = g;
+  ctx.lineWidth = fl.r * 2;
+  ctx.beginPath();
+  ctx.moveTo(fl.px, fl.py);
+  ctx.lineTo(tip.x, tip.y);
+  ctx.stroke();
+  // pivot hub
+  ctx.beginPath();
+  ctx.arc(fl.px, fl.py, fl.r + 2, 0, TAU);
+  ctx.fillStyle = '#222';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(fl.px, fl.py, fl.r * 0.5, 0, TAU);
+  ctx.fillStyle = T.colors.neon2;
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPlunger(ctx, T) {
+  const pl = T.plunger;
+  ctx.save();
+  // lane floor tint
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  ctx.fillRect(pl.laneL + 4, pl.top, pl.laneR - pl.laneL - 8, pl.bottom - pl.top);
+  // plunger shaft
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(pl.x, pl.headY + 14);
+  ctx.lineTo(pl.x, pl.bottom + 30);
+  ctx.stroke();
+  // plunger head
+  const charging = _pb.phase === 'plunge' && _pb.plungeCharge > 0;
+  ctx.fillStyle = charging ? T.colors.neon : '#bbb';
+  ctx.fillRect(pl.x - 14, pl.headY, 28, 14);
+  // charge meter
+  if (_pb.phase === 'plunge') {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(pl.laneL + 6, pl.bottom - 4, pl.laneR - pl.laneL - 12, 6);
+    ctx.fillStyle = T.colors.neon2;
+    ctx.fillRect(pl.laneL + 6, pl.bottom - 4,
+      (pl.laneR - pl.laneL - 12) * _pb.plungeCharge, 6);
   }
-  // Game over / scores overlay
-  if(_pb.phase==='gameover'||_pb.phase==='scores'){
-    ctx.fillStyle='rgba(0,0,0,0.78)';ctx.fillRect(0,0,PB.W,PB.H);
-    ctx.textAlign='center';
-    ctx.fillStyle=_tdef?.accentColor||'#ff4400';
-    ctx.font='bold 30px monospace';ctx.fillText('GAME OVER',PB.W/2,PB.H/2-90);
-    ctx.fillStyle='#ffdd00';ctx.font='bold 22px monospace';
-    ctx.fillText(_pb.score.toLocaleString(),PB.W/2,PB.H/2-52);
-    if(_pb.phase==='scores'){
-      ctx.fillStyle='#ffaa00';ctx.font='bold 13px monospace';
-      ctx.fillText('HIGH SCORES',PB.W/2,PB.H/2-18);
-      _pb.highScores.slice(0,5).forEach((s,i)=>{
-        ctx.fillStyle=i===0?'#ffdd00':'#666';
-        ctx.font=(i===0?'bold ':'')+' 11px monospace';
-        ctx.fillText((i+1)+'. '+s.score.toLocaleString(),PB.W/2,PB.H/2+4+i*18);
-      });
-      if(_pb.lastMatch){
-        ctx.fillStyle=_pb.lastMatch.won?'#44ff88':'#666';
-        ctx.font='10px monospace';
-        ctx.fillText(_pb.lastMatch.won?'★ MATCH! FREE GAME! ★':'MATCH: '+_pb.lastMatch.match,PB.W/2,PB.H/2+108);
+  ctx.restore();
+}
+
+function drawBall(ctx, ball, T) {
+  // z gives a scale boost + a separated shadow. The bigger the gap between
+  // the ball and its shadow, the higher it reads.
+  const zScale = 1 + ball.z / 220;          // up to ~1.3x at full ramp height
+  const shadowOff = ball.z * 0.16;          // shadow offset grows with height
+  const r = ball.r * zScale;
+  // trail
+  for (let i = 0; i < ball.trail.length; i++) {
+    const tp = ball.trail[i];
+    const a = (i / ball.trail.length) * 0.35;
+    ctx.beginPath();
+    ctx.arc(tp.x, tp.y, ball.r * (0.4 + i / ball.trail.length * 0.5), 0, TAU);
+    ctx.fillStyle = hexA(T.colors.neon2, a);
+    ctx.fill();
+  }
+  // shadow
+  ctx.beginPath();
+  ctx.ellipse(ball.x + shadowOff, ball.y + shadowOff, ball.r * 0.95, ball.r * 0.7, 0, 0, TAU);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fill();
+  // ball body
+  const g = ctx.createRadialGradient(
+    ball.x - r * 0.35, ball.y - r * 0.35, r * 0.15,
+    ball.x, ball.y, r);
+  g.addColorStop(0, '#ffffff');
+  g.addColorStop(0.5, '#c8d2e0');
+  g.addColorStop(1, '#5a6478');
+  ctx.beginPath();
+  ctx.arc(ball.x, ball.y, r, 0, TAU);
+  ctx.fillStyle = g;
+  ctx.fill();
+  // specular highlight
+  ctx.beginPath();
+  ctx.arc(ball.x - r * 0.3, ball.y - r * 0.3, r * 0.28, 0, TAU);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.fill();
+  // elevation ring when on a ramp
+  if (ball.z > 4) {
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, r + 3, 0, TAU);
+    ctx.strokeStyle = hexA(T.colors.neon2, 0.6);
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
+function drawAttractOverlay(ctx, T) {
+  ctx.fillStyle = 'rgba(5,5,20,0.78)';
+  ctx.fillRect(-20, -20, PB.W + 40, PB.H + 40);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = T.colors.neon;
+  ctx.font = 'bold 44px "Courier New", monospace';
+  ctx.fillText(T.name, PB.W / 2, PB.H / 2 - 40);
+  ctx.fillStyle = '#fff';
+  ctx.font = '16px monospace';
+  ctx.fillText('PRESS LAUNCH OR SPACE TO PLAY', PB.W / 2,
+    PB.H / 2 + 10 + Math.sin(_pb.tick * 0.08) * 2);
+  ctx.fillStyle = T.colors.neon2;
+  ctx.font = '13px monospace';
+  ctx.fillText('HIGH SCORE  ' + loadHighScore(T.id).toLocaleString(),
+    PB.W / 2, PB.H / 2 + 50);
+}
+function drawGameOverOverlay(ctx, T) {
+  ctx.fillStyle = 'rgba(5,5,20,0.82)';
+  ctx.fillRect(-20, -20, PB.W + 40, PB.H + 40);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = T.colors.neon;
+  ctx.font = 'bold 40px "Courier New", monospace';
+  ctx.fillText('GAME OVER', PB.W / 2, PB.H / 2 - 30);
+  ctx.fillStyle = '#fff';
+  ctx.font = '20px monospace';
+  ctx.fillText('SCORE  ' + _pb.score.toLocaleString(), PB.W / 2, PB.H / 2 + 14);
+  ctx.fillStyle = T.colors.neon2;
+  ctx.font = '13px monospace';
+  ctx.fillText('PRESS LAUNCH TO PLAY AGAIN', PB.W / 2, PB.H / 2 + 60);
+}
+
+// hex + alpha helper
+function hexA(hex, a) {
+  if (!hex) return `rgba(255,255,255,${a})`;
+  if (hex.startsWith('rgba') || hex.startsWith('rgb')) return hex;
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substring(0, 2), 16);
+  const g = parseInt(h.substring(2, 4), 16);
+  const b = parseInt(h.substring(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+
+/* ==========================================================================
+ * SECTION 19 — RENDER: DMD (dot-matrix display)
+ * --------------------------------------------------------------------------
+ * Build a virtual dot grid, then render it as glowing dots on the canvas.
+ * Phases: attract / play / flash / balllost / gameover.
+ * Future per-table animations slot into the attract + flash branches.
+ * ========================================================================== */
+function newGrid() {
+  const g = [];
+  for (let r = 0; r < DMD.rows; r++) g.push(new Array(DMD.cols).fill(0));
+  return g;
+}
+function drawDMD() {
+  const ctx = _dmdCtx;
+  const grid = newGrid();
+  const T = _table;
+
+  if (_pb.dmd.timer > 0) {
+    // FLASH message takes over
+    dmdTextCentered(grid, _pb.dmd.msg.substring(0, 16), 5, 1);
+    if (_pb.dmd.sub) dmdTextCentered(grid, _pb.dmd.sub.substring(0, 16), 15, 1);
+  } else if (_pb.phase === 'attract') {
+    dmdTextCentered(grid, T.name.substring(0, 16), 3, 1);
+    dmdTextCentered(grid, 'PRESS LAUNCH', 13, (_pb.dmd.t >> 4) & 1);
+    dmdText(grid, 'HI ' + shortNum(loadHighScore(T.id)), 2, 21, 1);
+  } else if (_pb.phase === 'gameover') {
+    dmdTextCentered(grid, 'GAME OVER', 4, 1);
+    dmdTextCentered(grid, shortNum(_pb.score), 14, 1);
+  } else if (_pb.phase === 'balllost') {
+    dmdTextCentered(grid, 'BALL LOST', 6, 1);
+    dmdTextCentered(grid, 'BALL ' + _pb.ball, 16, 1);
+  } else {
+    // PLAY: score big, ball + mult on a status line
+    const scoreStr = shortNum(_pb.score);
+    dmdText(grid, scoreStr, Math.max(2, DMD.cols - scoreStr.length * 6 - 2), 3, 1);
+    dmdText(grid, 'BALL ' + _pb.ball + '/' + _pb.ballsTotal, 2, 3, 1);
+    dmdText(grid, 'X' + _pb.mult, 2, 14, 1);
+    if (_pb.combo > 1) dmdText(grid, 'COMBO ' + _pb.combo, 30, 14, 1);
+    if (_pb.balls.length > 1) dmdText(grid, _pb.balls.length + ' BALLS', 2, 21, ((_pb.dmd.t>>3)&1));
+  }
+
+  // ---- render the grid as dots ----
+  const cw = DMD.dot, ch = DMD.dot;
+  const offX = (PB.DMD_W - DMD.cols * cw) / 2;
+  const offY = (PB.DMD_H - DMD.rows * ch) / 2;
+  // panel background
+  ctx.fillStyle = '#0a0d08';
+  ctx.fillRect(0, 0, PB.DMD_W, PB.DMD_H);
+  for (let r = 0; r < DMD.rows; r++) {
+    for (let c = 0; c < DMD.cols; c++) {
+      const on = grid[r][c];
+      const x = offX + c * cw, y = offY + r * ch;
+      if (on) {
+        ctx.fillStyle = '#ff8a1e';
+        ctx.shadowColor = '#ff8a1e'; ctx.shadowBlur = 4;
+        ctx.beginPath();
+        ctx.arc(x + cw/2, y + ch/2, cw * 0.42, 0, TAU);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      } else {
+        ctx.fillStyle = 'rgba(80,55,20,0.22)';
+        ctx.beginPath();
+        ctx.arc(x + cw/2, y + ch/2, cw * 0.30, 0, TAU);
+        ctx.fill();
       }
-      ctx.fillStyle='rgba(255,255,255,0.3)';ctx.font='9px monospace';
-      ctx.fillText('PRESS ANY BUTTON TO PLAY AGAIN',PB.W/2,PB.H-28);
-    }
-  }
-  if(_pb.phase==='lost'){
-    ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(0,PB.H/2-30,PB.W,55);
-    ctx.textAlign='center';ctx.fillStyle='#ff4400';
-    ctx.font='bold 20px monospace';ctx.fillText('BALL LOST!',PB.W/2,PB.H/2-8);
-    ctx.fillStyle='#888';ctx.font='10px monospace';
-    ctx.fillText(_pb.ballsLeft+' ball'+(+_pb.ballsLeft!==1?'s':'')+' remaining',PB.W/2,PB.H/2+12);
-  }
-}
-
-// ─── TABLE BACKGROUND DRAWS ───────────────────────────────────────────────────
-function drawWHBg(ctx){
-  const t=_pb.phaseTimer;
-  const gr=ctx.createRadialGradient(PB.W/2,PB.H*0.28,10,PB.W/2,PB.H*0.28,220);
-  gr.addColorStop(0,`rgba(30,0,70,${0.07+0.03*Math.sin(t)})`);
-  gr.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.fillStyle=gr;ctx.fillRect(0,0,PB.W,PB.H);
-}
-function drawBHBg(ctx){
-  const t=_pb.phaseTimer;
-  const gr=ctx.createRadialGradient(PB.W/2,PB.H*0.38,10,PB.W/2,PB.H*0.38,200);
-  gr.addColorStop(0,`rgba(70,25,0,${0.1+0.04*Math.sin(t*2)})`);
-  gr.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.fillStyle=gr;ctx.fillRect(0,0,PB.W,PB.H);
-  // Barf's House sign
-  ctx.fillStyle=`rgba(255,120,0,${0.14+0.06*Math.abs(Math.sin(t*1.5))})`;
-  ctx.font='bold 20px monospace';ctx.textAlign='center';
-  ctx.fillText("BARF'S HOUSE",PB.W/2,78);
-  // Laugh track
-  if(_pb.combo>2){
-    for(let i=0;i<7;i++){
-      const on=Math.sin(t*5+i)>0;
-      ctx.fillStyle=on?'rgba(255,200,0,0.55)':'rgba(100,80,0,0.2)';
-      ctx.beginPath();ctx.arc(95+i*43,66,5,0,Math.PI*2);ctx.fill();
     }
   }
 }
-function drawSDBg(ctx){
-  const t=_pb.phaseTimer;
-  const gr=ctx.createRadialGradient(PB.W/2,PB.H*0.25,10,PB.W/2,PB.H*0.25,220);
-  gr.addColorStop(0,`rgba(0,65,140,${0.08+0.04*Math.sin(t*1.5)})`);
-  gr.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.fillStyle=gr;ctx.fillRect(0,0,PB.W,PB.H);
-  // Grime overlay
-  const grime=(_pb.tableProgress.grime||0)/100;
-  if(grime>0){ctx.fillStyle=`rgba(55,38,8,${grime*0.35})`;ctx.fillRect(0,0,PB.W,PB.H);}
-  // Cleanliness
-  ctx.fillStyle=`rgba(0,200,255,${0.35+0.1*Math.sin(t*2)})`;
-  ctx.font='8px monospace';ctx.textAlign='left';
-  ctx.fillText(`CLEAN: ${Math.round(100-(grime*100))}%`,50,28);
+function shortNum(n) {
+  return Math.round(n).toString();
 }
 
-// ─── DMD (Dot Matrix Display) ─────────────────────────────────────────────────
-function drawDMD(){
-  if(!_dctx)return;
-  const W=PB.W,H=96;
-  _dctx.fillStyle='#040302';_dctx.fillRect(0,0,W,H);
-  // Draw based on game phase
-  if(_pb.phase==='attract') drawDMDAttract();
-  else if(_pb.phase==='play'||_pb.phase==='plunge') drawDMDPlay();
-  else if(_pb.phase==='lost') drawDMDLost();
-  else if(_pb.phase==='gameover'||_pb.phase==='scores') drawDMDGameOver();
-  // Scanlines
-  _dctx.fillStyle='rgba(0,0,0,0.15)';
-  for(let y=0;y<H;y+=2)_dctx.fillRect(0,y,W,1);
-  // Border
-  _dctx.strokeStyle='#2a2a2a';_dctx.lineWidth=2;_dctx.strokeRect(1,1,W-2,H-2);
+/* ==========================================================================
+ * SECTION 20 — HIGH SCORE PERSISTENCE
+ * ========================================================================== */
+function loadHighScore(id) {
+  try { return parseInt(localStorage.getItem('pinball_hi_' + id) || '0', 10) || 0; }
+  catch (e) { return 0; }
+}
+function saveHighScore(id, score) {
+  try { localStorage.setItem('pinball_hi_' + id, String(score)); } catch (e) {}
 }
 
-function dmdText(text,x,y,size,color,ctx){
-  const c=ctx||_dctx;
-  c.fillStyle=color||'#ffaa14';
-  c.font=`bold ${size}px monospace`;
-  c.textAlign='center';
-  c.textBaseline='middle';
-  // Glow
-  c.shadowColor=color||'#ffaa14';
-  c.shadowBlur=size*0.6;
-  c.fillText(text,x,y);
-  c.shadowBlur=0;
+/* ==========================================================================
+ * SECTION 21 — TABLE FACTORY
+ * --------------------------------------------------------------------------
+ * buildTable() returns a fully-built table or a 'placeholder' marker for the
+ * not-yet-built games. Adding a real table later = add a builder + case.
+ * ========================================================================== */
+function buildTable(id, tdef) {
+  switch (id) {
+    case 'worm_holer':    return buildWormHoler(tdef);
+    case 'barfs_house':   return { placeholder: true, id, name: tdef?.name || "BARF'S HOUSE" };
+    case 'shower_defense':return { placeholder: true, id, name: tdef?.name || 'SHOWER DEFENSE' };
+    default:              return buildWormHoler(tdef);
+  }
 }
 
-function drawDMDAttract(){
-  const t=_pb.phaseTimer;
-  const ac=_tdef?.accentColor||'#ff8c14';
-  const sc=_tdef?.secondColor||'#ff4400';
-  const W=PB.W,H=96;
-  // Pulsing background
-  const pulse=0.4+0.3*Math.abs(Math.sin(t*1.2));
-  _dctx.fillStyle=`rgba(${hexToRgb(ac)},${pulse*0.08})`;
-  _dctx.fillRect(0,0,W,H);
-  // Table name
-  const nameSize=Math.min(22,Math.floor(W/(_tdef?.name?.length||8)*0.8));
-  dmdText(_tdef?.name||'PINBALL BUDDY',W/2,30,nameSize,ac);
-  dmdText(_tdef?.subtitle||'',W/2,60,9,sc);
-  // Blinking start
-  if(Math.sin(t*2.5)>0.2) dmdText('PRESS ANY BUTTON',W/2,80,8,'#ffdd00');
-  if(_pb.highScores.length>0)
-    dmdText('HI '+_pb.highScores[0].score.toLocaleString(),W/2,10,8,'#ff8800');
+/* ==========================================================================
+ * SECTION 22 — UI / OVERLAY
+ * --------------------------------------------------------------------------
+ * Builds the full-screen overlay: a cabinet shell containing the DMD canvas
+ * stacked above the playfield canvas, with LEFT / LAUNCH / RIGHT buttons.
+ *
+ * IMPORTANT (historical bug): window.pbK and window.pbClose must be assigned
+ * BEFORE overlay innerHTML is set, because the button onclick attributes
+ * resolve in window scope. We instead attach listeners via addEventListener
+ * after insertion, which is robust and avoids the global entirely.
+ * ========================================================================== */
+function buildUI() {
+  _ov = document.createElement('div');
+  _ov.id = 'pinball-overlay';
+  _ov.innerHTML = `
+    <style>
+      #pinball-overlay{position:fixed;inset:0;z-index:99999;
+        background:radial-gradient(circle at 50% 30%, #1a1145 0%, #05050f 80%);
+        display:flex;align-items:center;justify-content:center;
+        font-family:'Courier New',monospace;user-select:none;-webkit-user-select:none;
+        touch-action:none;}
+      .pb-shell{display:flex;flex-direction:column;align-items:center;
+        gap:8px;max-height:100vh;padding:8px;box-sizing:border-box;}
+      .pb-dmd{border:3px solid #2a2a3a;border-radius:8px;
+        box-shadow:0 0 24px rgba(255,138,30,0.25),inset 0 0 12px #000;
+        background:#0a0d08;image-rendering:pixelated;}
+      .pb-pf{border:4px solid #2a2a3a;border-radius:10px;
+        box-shadow:0 0 40px rgba(57,215,255,0.18);background:#05050f;}
+      .pb-controls{display:flex;gap:10px;width:100%;max-width:540px;}
+      .pb-btn{flex:1;padding:16px 0;font-family:'Courier New',monospace;
+        font-weight:bold;font-size:15px;letter-spacing:1px;border:none;
+        border-radius:10px;color:#fff;cursor:pointer;
+        background:linear-gradient(180deg,#3a2f6a,#1a1145);
+        box-shadow:0 4px 0 #0a0820, 0 0 16px rgba(255,62,165,0.2);
+        transition:transform .04s,box-shadow .04s;}
+      .pb-btn:active,.pb-btn.pb-held{transform:translateY(3px);
+        box-shadow:0 1px 0 #0a0820,0 0 24px rgba(255,62,165,0.4);}
+      .pb-btn.pb-launch{background:linear-gradient(180deg,#ff3ea5,#a01060);}
+      .pb-close{position:absolute;top:14px;right:16px;width:38px;height:38px;
+        border-radius:50%;border:2px solid #5b4b9e;background:#1a1145;
+        color:#fff;font-size:18px;cursor:pointer;line-height:1;}
+      .pb-hint{color:#5b4b9e;font-size:11px;letter-spacing:1px;}
+    </style>
+    <button class="pb-close" title="Close (Esc)">✕</button>
+    <div class="pb-shell">
+      <canvas class="pb-dmd"  width="${PB.DMD_W}" height="${PB.DMD_H}"></canvas>
+      <canvas class="pb-pf"   width="${PB.W}"     height="${PB.H}"></canvas>
+      <div class="pb-controls">
+        <button class="pb-btn pb-left">◀ LEFT</button>
+        <button class="pb-btn pb-launch">LAUNCH</button>
+        <button class="pb-btn pb-right">RIGHT ▶</button>
+      </div>
+      <div class="pb-hint">◀ ▶ FLIPPERS &nbsp;·&nbsp; SPACE / LAUNCH = PLUNGER &nbsp;·&nbsp; ESC = EXIT</div>
+    </div>`;
+  document.body.appendChild(_ov);
+
+  _dmdCanvas = _ov.querySelector('.pb-dmd');
+  _dmdCtx = _dmdCanvas.getContext('2d');
+  _pfCanvas = _ov.querySelector('.pb-pf');
+  _pfCtx = _pfCanvas.getContext('2d');
+
+  // scale playfield to fit viewport height
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
+
+  // ---- button wiring (LEFT / RIGHT held; LAUNCH press+hold for plunger) ----
+  const lBtn = _ov.querySelector('.pb-left');
+  const rBtn = _ov.querySelector('.pb-right');
+  const launchBtn = _ov.querySelector('.pb-launch');
+  const closeBtn = _ov.querySelector('.pb-close');
+
+  bindHold(lBtn, () => setKey('left', true), () => setKey('left', false));
+  bindHold(rBtn, () => setKey('right', true), () => setKey('right', false));
+  bindHold(launchBtn,
+    () => { onLaunchPress(); launchBtn.classList.add('pb-held'); },
+    () => { onLaunchRelease(); launchBtn.classList.remove('pb-held'); });
+  closeBtn.addEventListener('click', closePinball);
+
+  // keyboard
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
 }
 
-function drawDMDPlay(){
-  const t=_pb.phaseTimer;
-  const ac=_tdef?.accentColor||'#ff8c14';
-  const W=PB.W,H=96;
-  // Flash message if active
-  if(_pb.dmdFlash>0){
-    const pulse=0.5+0.5*Math.abs(Math.sin(t*7));
-    _dctx.fillStyle=`rgba(${hexToRgb(ac)},${pulse*0.12})`;
-    _dctx.fillRect(0,0,W,H);
-    dmdText(_pb.dmdMsg,W/2,34,Math.min(20,Math.floor(W/(_pb.dmdMsg.length||8)*0.75)),`rgba(255,220,50,${0.7+pulse*0.3})`);
-    if(_pb.dmdSub) dmdText(_pb.dmdSub,W/2,64,9,ac);
-    dmdText(_pb.score.toLocaleString(),W/2,84,10,'#ffaa00');
+function fitCanvas() {
+  if (!_pfCanvas) return;
+  const avail = window.innerHeight - 240; // room for dmd + controls
+  const scale = Math.min(1, avail / PB.H, (window.innerWidth - 24) / PB.W);
+  _pfCanvas.style.width  = (PB.W * scale) + 'px';
+  _pfCanvas.style.height = (PB.H * scale) + 'px';
+  _dmdCanvas.style.width  = (PB.W * scale) + 'px';
+  _dmdCanvas.style.height = (PB.DMD_H * (PB.W * scale / PB.DMD_W)) + 'px';
+}
+
+function bindHold(el, onDown, onUp) {
+  const down = e => { e.preventDefault(); resumeAudio(); onDown(); el.classList.add('pb-held'); };
+  const up   = e => { e.preventDefault(); onUp(); el.classList.remove('pb-held'); };
+  el.addEventListener('mousedown', down);
+  el.addEventListener('mouseup', up);
+  el.addEventListener('mouseleave', up);
+  el.addEventListener('touchstart', down, { passive: false });
+  el.addEventListener('touchend', up, { passive: false });
+  el.addEventListener('touchcancel', up, { passive: false });
+}
+
+function setKey(which, val) { _keys[which] = val; }
+
+function onLaunchPress() {
+  resumeAudio();
+  if (_pb.phase === 'attract' || _pb.phase === 'gameover') {
+    startGame();
     return;
   }
-  // Normal play display
-  dmdText(_pb.score.toLocaleString(),W/2,32,22,'#ffcc00');
-  dmdText('BALL '+_pb.ballNum+'/3',W/2,62,10,ac);
-  if(_pb.multiplier>1) dmdText(_pb.multiplier+'× MULTIPLIER',W/2,80,9,'#ff4400');
-  else if(_pb.modeActive) dmdText(_pb.modeActive.toUpperCase(),W/2,80,9,'#ff0088');
-  else dmdText(_tdef?.name||'',W/2,80,9,'rgba(255,140,20,0.4)');
-  // Combo display top
-  if(_pb.combo>2) dmdText('COMBO ×'+_pb.combo,W/2,12,8,'#ff8800');
+  if (_pb.phase === 'plunge') _keys.space = true;
 }
-
-function drawDMDLost(){
-  const t=_pb.phaseTimer;
-  const W=PB.W;
-  for(let c=0;c<W;c+=4){
-    const h=(c+t*80)%96;
-    _dctx.fillStyle=`rgba(255,30,0,${0.08+0.04*Math.sin(c)})`;
-    _dctx.fillRect(c,96-h,3,h);
-  }
-  dmdText('BALL LOST!',W/2,35,20,'#ff3300');
-  dmdText(_pb.ballsLeft+' BALL'+(_pb.ballsLeft!==1?'S':'')+' REMAIN',W/2,65,10,'#ff8800');
-  dmdText(_pb.score.toLocaleString(),W/2,82,9,'#ffaa00');
-}
-
-function drawDMDGameOver(){
-  const t=_pb.phaseTimer;
-  const W=PB.W;
-  dmdText('GAME OVER',W/2,28,22,'#ff4400');
-  dmdText(_pb.score.toLocaleString(),W/2,58,16,'#ffcc00');
-  if(_pb.phase==='scores'){
-    if(_pb.highScores.length) dmdText('HI: '+_pb.highScores[0].score.toLocaleString(),W/2,80,9,'#ff8800');
-    if(Math.sin(t*2)>0) dmdText('PRESS TO PLAY AGAIN',W/2,90,7,'#888');
+function onLaunchRelease() {
+  if (_pb.phase === 'plunge' && _keys.space) {
+    _keys.space = false;
+    launchBall();
   }
 }
 
-// ─── AUDIO ────────────────────────────────────────────────────────────────────
-function initAudio(){try{_ac=new(window.AudioContext||window.webkitAudioContext)();}catch(e){_ac=null;}}
+function onKeyDown(e) {
+  if (e.repeat) return;
+  resumeAudio();
+  switch (e.key) {
+    case 'ArrowLeft':  _keys.left = true; e.preventDefault(); break;
+    case 'ArrowRight': _keys.right = true; e.preventDefault(); break;
+    case ' ': case 'Spacebar':
+      e.preventDefault();
+      onLaunchPress();
+      break;
+    case 'Escape': closePinball(); break;
+  }
+}
+function onKeyUp(e) {
+  switch (e.key) {
+    case 'ArrowLeft':  _keys.left = false; break;
+    case 'ArrowRight': _keys.right = false; break;
+    case ' ': case 'Spacebar': onLaunchRelease(); break;
+  }
+}
 
-function snd(name){
-  if(!_ac)return;
-  try{_ac.resume();}catch(e){}
-  const ac=_ac,now=ac.currentTime;
-  const g=ac.createGain();g.connect(ac.destination);
-  switch(name){
-    case 'flipper':{
-      const o=ac.createOscillator();o.type='sawtooth';
-      o.frequency.setValueAtTime(200,now);o.frequency.exponentialRampToValueAtTime(85,now+0.09);
-      g.gain.setValueAtTime(0.2,now);g.gain.exponentialRampToValueAtTime(0.001,now+0.11);
-      o.connect(g);o.start(now);o.stop(now+0.12);break;
-    }
-    case 'bumper':{
-      const o=ac.createOscillator(),o2=ac.createOscillator();
-      o.type='square';o2.type='sine';
-      o.frequency.setValueAtTime(450,now);o.frequency.exponentialRampToValueAtTime(220,now+0.13);
-      o2.frequency.setValueAtTime(900,now);o2.frequency.exponentialRampToValueAtTime(450,now+0.09);
-      g.gain.setValueAtTime(0.25,now);g.gain.exponentialRampToValueAtTime(0.001,now+0.16);
-      o.connect(g);o2.connect(g);o.start(now);o.stop(now+0.16);o2.start(now);o2.stop(now+0.12);break;
-    }
-    case 'target':{
-      const o=ac.createOscillator();o.type='square';
-      o.frequency.setValueAtTime(650,now);o.frequency.exponentialRampToValueAtTime(950,now+0.05);
-      g.gain.setValueAtTime(0.15,now);g.gain.exponentialRampToValueAtTime(0.001,now+0.12);
-      o.connect(g);o.start(now);o.stop(now+0.12);break;
-    }
-    case 'wall':{
-      const o=ac.createOscillator();o.type='sawtooth';o.frequency.value=100;
-      g.gain.setValueAtTime(0.07,now);g.gain.exponentialRampToValueAtTime(0.001,now+0.06);
-      o.connect(g);o.start(now);o.stop(now+0.06);break;
-    }
-    case 'ramp':{
-      [300,420,560,700].forEach((f,i)=>{
-        const o=ac.createOscillator(),og=ac.createGain();o.type='sine';o.frequency.value=f;
-        og.gain.setValueAtTime(0,now+i*0.07);og.gain.linearRampToValueAtTime(0.15,now+i*0.07+0.05);
-        og.gain.exponentialRampToValueAtTime(0.001,now+i*0.07+0.15);
-        o.connect(og);og.connect(ac.destination);o.start(now+i*0.07);o.stop(now+i*0.07+0.18);
-      });break;
-    }
-    case 'drain':{
-      const o=ac.createOscillator();o.type='sawtooth';
-      o.frequency.setValueAtTime(220,now);o.frequency.exponentialRampToValueAtTime(38,now+0.55);
-      g.gain.setValueAtTime(0.32,now);g.gain.exponentialRampToValueAtTime(0.001,now+0.6);
-      o.connect(g);o.start(now);o.stop(now+0.62);break;
-    }
-    case 'launch':{
-      const o=ac.createOscillator();o.type='sawtooth';
-      o.frequency.setValueAtTime(70,now);o.frequency.exponentialRampToValueAtTime(420,now+0.22);
-      g.gain.setValueAtTime(0.28,now);g.gain.exponentialRampToValueAtTime(0.001,now+0.26);
-      o.connect(g);o.start(now);o.stop(now+0.28);break;
-    }
-    case 'groupComplete':{
-      [523,659,784,1047,1319].forEach((f,i)=>{
-        const o=ac.createOscillator(),og=ac.createGain();o.type='sine';o.frequency.value=f;
-        og.gain.setValueAtTime(0.22,now+i*0.09);og.gain.exponentialRampToValueAtTime(0.001,now+i*0.09+0.22);
-        o.connect(og);og.connect(ac.destination);o.start(now+i*0.09);o.stop(now+i*0.09+0.25);
-      });break;
-    }
-    case 'wormHole':{
-      const o=ac.createOscillator();o.type='sawtooth';
-      o.frequency.setValueAtTime(1400,now);o.frequency.exponentialRampToValueAtTime(60,now+0.45);
-      g.gain.setValueAtTime(0.28,now);g.gain.exponentialRampToValueAtTime(0.001,now+0.5);
-      o.connect(g);o.start(now);o.stop(now+0.5);break;
-    }
-    case 'wormHoleActivate':{
-      for(let i=0;i<9;i++){
-        const o=ac.createOscillator(),og=ac.createGain();o.type='sine';
-        o.frequency.setValueAtTime(80+i*55,now+i*0.055);o.frequency.exponentialRampToValueAtTime(900,now+i*0.055+0.3);
-        og.gain.setValueAtTime(0.12,now+i*0.055);og.gain.exponentialRampToValueAtTime(0.001,now+i*0.055+0.38);
-        o.connect(og);og.connect(ac.destination);o.start(now+i*0.055);o.stop(now+i*0.055+0.42);
-      }break;
-    }
-    case 'multiball':{
-      [280,380,500,650,800,1000].forEach((f,i)=>{
-        const o=ac.createOscillator(),og=ac.createGain();o.type='square';o.frequency.value=f;
-        og.gain.setValueAtTime(0.14,now+i*0.06);og.gain.exponentialRampToValueAtTime(0.001,now+i*0.06+0.18);
-        o.connect(og);og.connect(ac.destination);o.start(now+i*0.06);o.stop(now+i*0.06+0.22);
-      });break;
-    }
-    case 'modeStart':{
-      [380,560,780,1040].forEach((f,i)=>{
-        const o=ac.createOscillator(),og=ac.createGain();o.type='sawtooth';o.frequency.value=f;
-        og.gain.setValueAtTime(0.16,now+i*0.07);og.gain.exponentialRampToValueAtTime(0.001,now+i*0.07+0.2);
-        o.connect(og);og.connect(ac.destination);o.start(now+i*0.07);o.stop(now+i*0.07+0.22);
-      });break;
-    }
-    case 'modeEnd':{
-      [1040,780,560,380,220].forEach((f,i)=>{
-        const o=ac.createOscillator(),og=ac.createGain();o.type='sine';o.frequency.value=f;
-        og.gain.setValueAtTime(0.16,now+i*0.08);og.gain.exponentialRampToValueAtTime(0.001,now+i*0.08+0.22);
-        o.connect(og);og.connect(ac.destination);o.start(now+i*0.08);o.stop(now+i*0.08+0.26);
-      });break;
-    }
-    case 'gameOver':{
-      [380,330,280,230,180,130].forEach((f,i)=>{
-        const o=ac.createOscillator(),og=ac.createGain();o.type='sawtooth';o.frequency.value=f;
-        og.gain.setValueAtTime(0.22,now+i*0.18);og.gain.exponentialRampToValueAtTime(0.001,now+i*0.18+0.28);
-        o.connect(og);og.connect(ac.destination);o.start(now+i*0.18);o.stop(now+i*0.18+0.32);
-      });break;
+/* ==========================================================================
+ * SECTION 23 — PLACEHOLDER SCREEN (Barf's House / Shower Defense)
+ * ========================================================================== */
+function runPlaceholder(table) {
+  // simple static "coming soon" screen drawn into the playfield canvas
+  const ctx = _pfCtx;
+  function draw() {
+    if (!_running) return;
+    _raf = requestAnimationFrame(draw);
+    ctx.fillStyle = '#05050f';
+    ctx.fillRect(0, 0, PB.W, PB.H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff3ea5';
+    ctx.font = 'bold 34px "Courier New",monospace';
+    ctx.fillText(table.name, PB.W/2, PB.H/2 - 60);
+    ctx.fillStyle = '#39d7ff';
+    ctx.font = '18px monospace';
+    ctx.fillText('TABLE UNDER CONSTRUCTION', PB.W/2, PB.H/2);
+    ctx.fillStyle = '#5b4b9e';
+    ctx.font = '13px monospace';
+    ctx.fillText('Coming in a future update.', PB.W/2, PB.H/2 + 36);
+    ctx.fillText('Press ESC to return.', PB.W/2, PB.H/2 + 58);
+    // DMD shows the table name scrolling
+    const grid = newGrid();
+    dmdTextCentered(grid, table.name.substring(0,16), 5, 1);
+    dmdTextCentered(grid, 'COMING SOON', 15, (( _pb.dmd?.t ?? 0)>>4)&1 || 1);
+    renderGridToDMD(grid);
+    if (_pb.dmd) _pb.dmd.t++;
+  }
+  _pb = freshPB();
+  draw();
+}
+function renderGridToDMD(grid) {
+  const ctx = _dmdCtx;
+  const cw = DMD.dot, ch = DMD.dot;
+  const offX = (PB.DMD_W - DMD.cols * cw) / 2;
+  const offY = (PB.DMD_H - DMD.rows * ch) / 2;
+  ctx.fillStyle = '#0a0d08';
+  ctx.fillRect(0, 0, PB.DMD_W, PB.DMD_H);
+  for (let r = 0; r < DMD.rows; r++) for (let c = 0; c < DMD.cols; c++) {
+    const x = offX + c*cw, y = offY + r*ch;
+    if (grid[r][c]) {
+      ctx.fillStyle = '#ff8a1e'; ctx.shadowColor = '#ff8a1e'; ctx.shadowBlur = 4;
+      ctx.beginPath(); ctx.arc(x+cw/2, y+ch/2, cw*0.42, 0, TAU); ctx.fill();
+      ctx.shadowBlur = 0;
+    } else {
+      ctx.fillStyle = 'rgba(80,55,20,0.22)';
+      ctx.beginPath(); ctx.arc(x+cw/2, y+ch/2, cw*0.30, 0, TAU); ctx.fill();
     }
   }
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function lhn(hex,a){
-  let r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
-  return `#${[r,g,b].map(v=>Math.min(255,Math.round(v+(255-v)*a)).toString(16).padStart(2,'0')).join('')}`;
-}
-function dkn(hex,a){
-  let r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
-  return `#${[r,g,b].map(v=>Math.max(0,Math.round(v*(1-a))).toString(16).padStart(2,'0')).join('')}`;
-}
-function hexToRgb(hex){
-  const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
-  return `${r},${g},${b}`;
+/* ==========================================================================
+ * SECTION 24 — LIFECYCLE / EXPORT
+ * ========================================================================== */
+async function loadTableDef(id) {
+  try {
+    const res = await fetch('./data/pinball_tables.json');
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data.tables || []).find(t => t.id === id) || null;
+  } catch (e) { return null; }
 }
 
-// ─── STYLES ───────────────────────────────────────────────────────────────────
-function injectStyles(){
-  if(document.getElementById('pbSt'))return;
-  const s=document.createElement('style');s.id='pbSt';
-  s.textContent=`
-.pb-ov{position:fixed;inset:0;background:rgba(0,0,0,0.94);display:flex;align-items:center;justify-content:center;z-index:9000;backdrop-filter:blur(3px);}
-.pb-shell{display:flex;flex-direction:column;align-items:center;position:relative;max-height:100dvh;overflow:hidden;}
-.pb-dmd-bar{width:${PB.W}px;flex-shrink:0;background:#040302;border:2px solid #2a2a2a;border-bottom:none;border-radius:6px 6px 0 0;overflow:hidden;}
-#pbDMD{display:block;}
-.pb-field{flex-shrink:1;overflow:hidden;line-height:0;}
-#pbCanvas{display:block;max-height:calc(100dvh - 96px - 52px);width:auto;touch-action:none;}
-.pb-btns{width:${PB.W}px;display:flex;gap:3px;background:#080808;border:2px solid #222;border-top:1px solid #2a2a2a;padding:5px 6px;box-sizing:border-box;flex-shrink:0;}
-.pb-btn{font-family:monospace;font-weight:bold;font-size:13px;padding:9px 0;border:2px solid #333;border-radius:5px;background:#101010;color:#fff;cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation;user-select:none;}
-.pb-btn:active,.pb-btn:focus{background:#282828;border-color:#888;outline:none;}
-.pb-l{flex:3;text-align:left;padding-left:12px;}
-.pb-r{flex:3;text-align:right;padding-right:12px;}
-.pb-m{flex:1;font-size:10px;color:#777;text-align:center;}
-.pb-x{position:fixed;top:8px;right:8px;width:34px;height:34px;border-radius:50%;border:1px solid #555;background:rgba(0,0,0,0.75);color:#aaa;cursor:pointer;font-size:15px;display:flex;align-items:center;justify-content:center;z-index:9100;}
-.pb-x:hover{border-color:#fff;color:#fff;}
-`;
-  document.head.appendChild(s);
+/**
+ * openPinball(tableId, state?, data?, api?)
+ * state/data/api are optional SPACED engine references; null = standalone.
+ */
+export async function openPinball(tableId = 'worm_holer', state = null, data = null, api = null) {
+  if (_running) return;            // already open
+  _running = true;
+  _spaced = (state || data || api) ? { state, data, api } : null;
+
+  _tdef = await loadTableDef(tableId);
+  _table = buildTable(tableId, _tdef);
+
+  initAudio();
+  buildUI();
+  _pb = freshPB();
+  _lastT = performance.now();
+
+  if (_table.placeholder) {
+    runPlaceholder(_table);
+    return;
+  }
+
+  _pb.phase = 'attract';
+  _pb.highScore = loadHighScore(_table.id);
+  _raf = requestAnimationFrame(tick);
+}
+
+/** closePinball() — full teardown. Safe to call multiple times. */
+export function closePinball() {
+  if (!_running) return;
+  _running = false;
+  cancelAnimationFrame(_raf);
+  window.removeEventListener('keydown', onKeyDown);
+  window.removeEventListener('keyup', onKeyUp);
+  window.removeEventListener('resize', fitCanvas);
+  if (_ac) { try { _ac.close(); } catch (e) {} _ac = null; }
+  if (_ov && _ov.parentNode) _ov.parentNode.removeChild(_ov);
+  _ov = null; _pfCanvas = _pfCtx = _dmdCanvas = _dmdCtx = null;
+  _table = null; _tdef = null; _spaced = null;
+  _keys.left = _keys.right = _keys.space = false;
+}
+
+// convenience: expose on window for SPACED tile triggers / debugging
+if (typeof window !== 'undefined') {
+  window.openPinball = openPinball;
+  window.closePinball = closePinball;
 }
