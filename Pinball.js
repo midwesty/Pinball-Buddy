@@ -191,7 +191,18 @@ function updatePlunge(dt){
     _pb.plungerCharge=Math.min(_pb.plungerCharge+0.55*dt,PB.PLUNGER_MAX);
   } else if(_pb.plungerCharge>0){
     launchBall();
+    return;
   }
+  // Keep ball sitting on plunger head — it moves UP as charge increases
+  // laneBot=PB.H-90, plunger compresses up to 60% of laneH
+  const laneBot=PB.H-90, laneTop=90, laneH=laneBot-laneTop;
+  const charge=_pb.plungerCharge/PB.PLUNGER_MAX;
+  const springH=charge*laneH*0.6;
+  const springY=laneBot-springH;
+  // Ball center sits just above plunger head (r=9) by ball radius (r=11)
+  _pb.ball.x=PB.W-26;
+  _pb.ball.y=springY-9-PB.BALL_R;
+  _pb.ball.vx=0; _pb.ball.vy=0;
 }
 
 function updatePlay(dt){
@@ -258,20 +269,22 @@ function wallBounce(b){
     // Ball still in lane and below exit — keep it contained
     if(b.x<wallR+4){b.x=wallR+4;b.vx=Math.abs(b.vx)*0.5;}
   }
-  // One-way deflector at TOP of plunger lane — curved guide forces ball LEFT onto playfield
-  const defY=exitY;
-  if(b.x>wallR-25&&b.y<=defY+5&&b.y>=defY-50){
-    // Ball reached the exit — kick it left onto the playfield
-    if(b.vy<0){ // moving upward
-      b.vx=-Math.abs(b.vx)*0.9-4;
-      b.vy*=0.7;
-      b.x=wallR-26;
-    }
+  // Curved exit at TOP of plunger lane
+  // When ball travels up the lane and reaches near the top (y < 130),
+  // the curved guide deflects it LEFT onto the playfield
+  if(b.x>wallR-6&&b.y<130&&b.vy<0){
+    // Ball has reached the top of the lane — curve it left
+    b.vx=-Math.abs(b.vx)*0.7-5; // strong leftward kick
+    b.vy*=0.55;                   // reduce upward velocity (curving around the bend)
+    b.x=wallR-18;                 // move ball left of the lane wall
+    b.y=Math.max(b.y,wallT+PB.BALL_R+2); // keep above top wall
   }
-  // If ball falls back into plunger lane (didn't have enough power), reset to plunger
-  if(b.x>wallR-4&&b.vy>0&&b.y>PB.H-180&&_pb.phase==='play'){
-    // Ball fell back into plunger — reset to plunge state
-    b.x=PB.W-26; b.y=90; b.vx=0; b.vy=0;
+  // If ball falls back into plunger lane after failed launch, allow relaunch
+  if(b.x>wallR-8&&b.vy>0&&b.y>PB.H-200&&_pb.phase==='play'){
+    // Ball fell back — reset to plunger bottom for relaunch
+    _pb.ball.x=PB.W-26;
+    _pb.ball.y=PB.H-110;
+    _pb.ball.vx=0; _pb.ball.vy=0;
     _pb.phase='plunge'; _pb.plungerCharge=0;
     _pb.dmdMsg='PULL AND RELEASE'; _pb.dmdSub='TRY AGAIN!'; _pb.dmdFlash=2;
   }
@@ -509,8 +522,9 @@ function dmd(msg,sub){_pb.dmdMsg=msg;_pb.dmdSub=sub||'';_pb.dmdFlash=2.5;}
 
 // ─── BALL START / END ─────────────────────────────────────────────────────────
 function startBall(){
-  // Spawn at TOP of plunger lane so player gets full plunger travel
-  _pb.ball={x:PB.W-26,y:90,vx:0,vy:0,z:0,vz:0,active:true,lost:false};
+  // Ball rests at BOTTOM of plunger lane, sitting on the plunger head
+  // laneBot=PB.H-90=730, plunger head r=9, ball r=11 => ball center at 730-20=710
+  _pb.ball={x:PB.W-26,y:PB.H-110,vx:0,vy:0,z:0,vz:0,active:true,lost:false};
   _pb.extras=[]; _pb.plungerCharge=0; _pb.launched=false;
   _pb.targets.forEach(t=>t.hit=false);
   _pb.dropBanks.forEach(bk=>bk.targets.forEach(t=>t.hit=false));
@@ -521,8 +535,12 @@ function startBall(){
 }
 
 function launchBall(){
-  _pb.ball.vy=-_pb.plungerCharge*1.1;
-  _pb.ball.vx=-0.2; // slight left nudge toward playfield
+  // Ball is currently sitting on the plunger head somewhere in the lane.
+  // Release: give it full upward velocity from current position.
+  // Minimum velocity ensures ball always makes it to the exit arc.
+  const minVy=18; // enough to reach top from rest position
+  _pb.ball.vy=-Math.max(_pb.plungerCharge*1.15, minVy);
+  _pb.ball.vx=-0.3; // slight left nudge so ball curves toward playfield exit
   _pb.plungerCharge=0; _pb.launched=true;
   _pb.phase='play';
   snd('launch');
@@ -1041,13 +1059,29 @@ function drawField(ctx){
   // Plunger lane
   ctx.fillStyle='rgba(255,255,255,0.025)';
   ctx.fillRect(wallR,PB.H-270,PB.W-wallR,270);
-  // Plunger lane deflector arc (curved guide at top)
+  // Plunger lane exit arc at TOP — curved guide that routes ball onto playfield
+  // This is the most important visual: player sees where ball will exit
   ctx.strokeStyle=t.railColor||'#0022aa';
-  ctx.lineWidth=5; ctx.lineCap='round';
+  ctx.lineWidth=6; ctx.lineCap='round';
+  // Main curved guide: from top of lane wall, sweeps left onto playfield
   ctx.beginPath();
-  ctx.moveTo(wallR,PB.H-270);
-  ctx.quadraticCurveTo(wallR-15,PB.H-295,wallR-40,PB.H-285);
+  ctx.moveTo(wallR+2, 125);              // top of lane wall
+  ctx.quadraticCurveTo(wallR+2, wallT+8, wallR-55, wallT+8); // curves left along top
   ctx.stroke();
+  // Bright highlight on the curve so it's clearly visible
+  ctx.strokeStyle='rgba(255,255,255,0.18)';
+  ctx.lineWidth=2;
+  ctx.beginPath();
+  ctx.moveTo(wallR+2, 125);
+  ctx.quadraticCurveTo(wallR+2, wallT+8, wallR-55, wallT+8);
+  ctx.stroke();
+  // Small arrow showing exit direction
+  ctx.fillStyle=t.railColor||'#0022aa';
+  ctx.beginPath();
+  ctx.moveTo(wallR-55, wallT+4);
+  ctx.lineTo(wallR-65, wallT+12);
+  ctx.lineTo(wallR-55, wallT+16);
+  ctx.fill();
   // Center divider line
   ctx.strokeStyle='rgba(255,255,255,0.03)';
   ctx.lineWidth=1; ctx.setLineDash([3,6]);
@@ -1340,38 +1374,57 @@ function drawFlippers(ctx){
 
 function drawPlunger(ctx){
   if(_pb.phase!=='plunge')return;
-  // Plunger runs full lane height — ball at top, plunger spring at bottom
-  const px=PB.W-26, laneTop=90, laneBot=PB.H-90;
+  const px=PB.W-26, laneBot=PB.H-90, laneTop=90;
   const laneH=laneBot-laneTop;
   const charge=_pb.plungerCharge/PB.PLUNGER_MAX;
-  // Lane track
-  ctx.strokeStyle='#222';ctx.lineWidth=6;ctx.lineCap='round';
-  ctx.beginPath();ctx.moveTo(px,laneTop);ctx.lineTo(px,laneBot);ctx.stroke();
-  // Spring compression bar (draws up from bottom as charge increases)
-  const springH=charge*laneH*0.6; // spring compresses up to 60% of lane
+  const springH=charge*laneH*0.6;
   const springY=laneBot-springH;
+  const ballY=springY-9-PB.BALL_R; // ball center above plunger head
+
+  // Lane track (full height guide rail)
+  ctx.strokeStyle='#1a1a1a';ctx.lineWidth=8;ctx.lineCap='round';
+  ctx.beginPath();ctx.moveTo(px,laneTop);ctx.lineTo(px,laneBot);ctx.stroke();
+
+  // Spring coil visual (below plunger head)
+  ctx.strokeStyle='#333';ctx.lineWidth=3;
+  for(let sy=springY+12;sy<laneBot-8;sy+=10){
+    ctx.beginPath();ctx.moveTo(px-5,sy);ctx.lineTo(px+5,sy+5);ctx.stroke();
+  }
+
+  // Spring compression bar (power indicator)
   const col=charge<0.4?'#44ff88':charge<0.75?'#ffcc00':'#ff4400';
-  ctx.strokeStyle=col;ctx.lineWidth=9;
-  ctx.shadowColor=col;ctx.shadowBlur=14;
+  ctx.strokeStyle=col;ctx.lineWidth=6;
+  ctx.shadowColor=col;ctx.shadowBlur=12;
   ctx.beginPath();ctx.moveTo(px,laneBot);ctx.lineTo(px,springY);ctx.stroke();
   ctx.shadowBlur=0;
-  // Plunger head (tip of spring, moves up with charge)
-  ctx.fillStyle='#ddd';ctx.strokeStyle=col;ctx.lineWidth=2;
+
+  // Plunger head disk
+  ctx.fillStyle='#cccccc';ctx.strokeStyle=col;ctx.lineWidth=2.5;
+  ctx.shadowColor=col;ctx.shadowBlur=8;
   ctx.beginPath();ctx.arc(px,springY,9,0,Math.PI*2);ctx.fill();ctx.stroke();
-  // Ball sitting at top waiting to be launched
-  const bc=_tdef?.ballColor||'#c0e0ff';
-  const gr=ctx.createRadialGradient(px-3,laneTop-3,0,px,laneTop,PB.BALL_R);
-  gr.addColorStop(0,'#fff');gr.addColorStop(0.4,bc);gr.addColorStop(1,dkn(bc,0.5));
-  ctx.fillStyle=gr;ctx.shadowColor=bc;ctx.shadowBlur=8;
-  ctx.beginPath();ctx.arc(px,laneTop,PB.BALL_R,0,Math.PI*2);ctx.fill();
   ctx.shadowBlur=0;
-  // Hint text
+
+  // Ball sitting ON the plunger head — moves with it
+  // (ball.y is set in updatePlunge, we just draw it here visually)
+  const bc=_tdef?.ballColor||'#c0e0ff';
+  const gr=ctx.createRadialGradient(px-3,ballY-3,0,px,ballY,PB.BALL_R);
+  gr.addColorStop(0,'#fff');gr.addColorStop(0.35,bc);gr.addColorStop(1,dkn(bc,0.5));
+  ctx.fillStyle=gr;ctx.shadowColor=bc;ctx.shadowBlur=10;
+  ctx.beginPath();ctx.arc(px,ballY,PB.BALL_R,0,Math.PI*2);ctx.fill();
+  ctx.shadowBlur=0;
+  // Ball specular
+  ctx.fillStyle='rgba(255,255,255,0.6)';
+  ctx.beginPath();ctx.arc(px-3,ballY-3,PB.BALL_R*0.28,0,Math.PI*2);ctx.fill();
+
+  // Hint text below plunger
   if(charge<0.05){
-    ctx.fillStyle='rgba(255,255,255,0.4)';ctx.font='8px monospace';ctx.textAlign='center';
+    ctx.fillStyle='rgba(255,255,255,0.35)';ctx.font='8px monospace';ctx.textAlign='center';
     ctx.fillText('HOLD LAUNCH',px,laneBot+14);
   } else {
     ctx.fillStyle=col;ctx.font='bold 9px monospace';ctx.textAlign='center';
+    ctx.shadowColor=col;ctx.shadowBlur=6;
     ctx.fillText('RELEASE!',px,laneBot+14);
+    ctx.shadowBlur=0;
   }
 }
 
