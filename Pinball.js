@@ -6,6 +6,9 @@
  *             entry, high-score table, credit/match/free-game, teleport holes
  * v0.006    — DMD layout fix, shot sequence, modes, ramp combos, extra balls,
  *             lit teleport holes, story beats (all table-data-driven for reuse)
+ * v0.007    — COSMIC CLUCKERS (alien diner, upper-deck booths, sitcom beats)
+ *             and SHOWER DEFENSE (waves, shower toggle, drain beast). Shared
+ *             cabinet frame, table-driven dispatch (onBankComplete, onLanesComplete).
  *
  * Single-file ES module. Exports openPinball().
  *
@@ -87,7 +90,7 @@ const PB = {
 // playfield bounding walls (used by every table)
 const WALL = { L: 26, R: 514, T: 26, DRAIN_Y: 944 };
 
-export const PB_VERSION = 'v0.006';
+export const PB_VERSION = 'v0.007';
 
 /* ==========================================================================
  * SECTION 3 — COLLIDER PRIMITIVES
@@ -391,6 +394,19 @@ function snd(name) {
     case 'combo':           tone(659, 0.12, 'square', 0.14, 988); break;
     case 'extraBall':       [523,659,784,1046,1318].forEach((f,i)=>setTimeout(()=>tone(f,0.22,'sine',0.16),i*90)); break;
     case 'story':           tone(330, 0.12, 'triangle', 0.10, 440); break;
+    // ---- Cosmic Cluckers cues ------------------------------------------
+    case 'orderUp':         [880,659,523].forEach((f,i)=>setTimeout(()=>tone(f,0.14,'square',0.14),i*70)); break;
+    case 'bell':            tone(1568, 0.16, 'sine', 0.18, 2093); break;
+    case 'doorBell':        [659, 523].forEach((f,i)=>setTimeout(()=>tone(f,0.25,'sine',0.16),i*180)); break;
+    case 'cashRegister':    [1318,988,1568].forEach((f,i)=>setTimeout(()=>tone(f,0.12,'square',0.14),i*60)); noise(0.15,0.10,2000); break;
+    case 'sizzle':          noise(0.4, 0.12, 3000); break;
+    // ---- Shower Defense cues -------------------------------------------
+    case 'bugSquish':       noise(0.15, 0.18, 800); tone(180,0.10,'sawtooth',0.12,80); break;
+    case 'moldSplat':       noise(0.25, 0.15, 400); break;
+    case 'showerOn':        noise(0.6, 0.16, 1800); tone(440,0.4,'sine',0.10,880); break;
+    case 'shower':          noise(0.25, 0.14, 2200); break;
+    case 'drainBeast':      tone(60, 0.5, 'sawtooth', 0.20, 30); noise(0.5, 0.14, 200); break;
+    case 'beastRoar':       tone(80, 0.8, 'sawtooth', 0.22, 40); noise(0.8, 0.16, 300); break;
     default: break;
   }
 }
@@ -777,6 +793,196 @@ function dmdDigitBig(grid, x, y, d) {
   for (let r = 0; r < 7; r++)
     for (let c = 0; c < 5; c++)
       if (g[r][c] === '1') dmdRect(grid, x + c * 2, y + r * 2, 2, 2, 1);
+}
+
+/* ==========================================================================
+ * SECTION 7d — TABLE-THEMED DMD ANIMATIONS
+ * --------------------------------------------------------------------------
+ * Each table has its own visual personality on the DMD. These small dot
+ * sketches give each game a distinct identity. All are built from the same
+ * primitives (dmdDot, dmdLine, dmdCircle, dmdRect, dmdBox, dmdText).
+ * ========================================================================== */
+
+// ---- BLEEB THE ALIEN (Cosmic Cluckers mascot) --------------------------
+// A small 5-wide alien sprite. Draws him at (cx, cy) with optional wave arm.
+function dmdBleeb(grid, cx, cy, wave) {
+  // head (oval)
+  dmdCircle(grid, cx, cy, 3, 1, true);
+  // antenna
+  dmdDot(grid, cx, cy - 4, 1);
+  dmdDot(grid, cx, cy - 5, 1);
+  // eyes (two dots, "off" inside head)
+  dmdDot(grid, cx - 1, cy - 1, 0);
+  dmdDot(grid, cx + 1, cy - 1, 0);
+  // body
+  dmdRect(grid, cx - 2, cy + 2, 5, 4, 1);
+  // arms — left static, right waves
+  dmdDot(grid, cx - 3, cy + 3, 1);
+  if (wave) {
+    dmdDot(grid, cx + 3, cy + 1, 1);
+    dmdDot(grid, cx + 4, cy + 0, 1);
+  } else {
+    dmdDot(grid, cx + 3, cy + 3, 1);
+  }
+  // legs
+  dmdDot(grid, cx - 1, cy + 6, 1); dmdDot(grid, cx + 1, cy + 6, 1);
+}
+function dmdChickenLeg(grid, cx, cy) {
+  // a tiny drumstick shape
+  dmdCircle(grid, cx, cy, 2, 1, true);
+  dmdLine(grid, cx, cy + 1, cx + 3, cy + 4);
+}
+function dmdPlate(grid, cx, cy, w = 8) {
+  // an oval plate
+  for (let dx = -w; dx <= w; dx++) {
+    const dy = Math.round(Math.sqrt(Math.max(0, 1 - (dx * dx) / (w * w))) * 2);
+    dmdDot(grid, cx + dx, cy - dy, 1);
+    dmdDot(grid, cx + dx, cy + dy, 1);
+  }
+  dmdLine(grid, cx - w, cy, cx + w, cy, 1);
+}
+
+function animOrderUp() {
+  return {
+    dur: 180, sound: 'orderUp',
+    cues: [{ at: 80, snd: 'bell' }],
+    render(grid, p, t) {
+      // Bleeb at left, slides plate across to right
+      dmdBleeb(grid, 16, 12, ((t >> 3) & 1));
+      const plateX = 28 + Math.floor(p * 70);
+      dmdPlate(grid, plateX, 13, 6);
+      dmdChickenLeg(grid, plateX, 12);
+      dmdTextCentered(grid, 'ORDER UP', 22, ((t >> 3) & 1));
+    },
+  };
+}
+
+// Used for the GORDON drops-in beat — silhouette pops into the doorway
+function animBossVisit() {
+  return {
+    dur: 150, sound: 'doorBell',
+    render(grid, p, t) {
+      // door frame at right
+      dmdBox(grid, 80, 4, 18, 22, 1);
+      // boss silhouette appears
+      const x = 88;
+      const inside = Math.min(1, p * 2);
+      if (inside > 0.2) {
+        dmdRect(grid, x, 8, 4, 5, 1);      // head
+        dmdRect(grid, x - 1, 13, 6, 8, 1); // body
+      }
+      // Bleeb panics at left
+      dmdBleeb(grid, 14, 13, ((t >> 1) & 1));
+      dmdTextCentered(grid, 'GORDON HERE', 24, ((t >> 3) & 1));
+    },
+  };
+}
+
+// Tips raining (a brief mode-start cutscene the engine doesn't run unless we
+// call dmdPlay directly — left available for callers)
+function animTipsRain() {
+  return {
+    dur: 150, sound: 'cashRegister',
+    render(grid, p, t) {
+      dmdTextCentered(grid, 'TIPS RAINING', 4, 1);
+      // dollar signs fall
+      for (let i = 0; i < 10; i++) {
+        const x = (i * 11 + t * 0.3) % DMD.cols;
+        const y = ((t * 0.4 + i * 5) % DMD.rows);
+        dmdDot(grid, x | 0, y | 0, 1);
+        dmdDot(grid, (x + 1) | 0, (y + 1) | 0, 1);
+      }
+      dmdBleeb(grid, DMD.cols / 2, 18, ((t >> 2) & 1));
+    },
+  };
+}
+
+// ---- SHOWER DEFENSE animations ----------------------------------------
+function dmdBug(grid, cx, cy) {
+  // body
+  dmdCircle(grid, cx, cy, 2, 1, true);
+  // legs
+  dmdDot(grid, cx - 3, cy - 1, 1); dmdDot(grid, cx + 3, cy - 1, 1);
+  dmdDot(grid, cx - 3, cy + 1, 1); dmdDot(grid, cx + 3, cy + 1, 1);
+  // antennae
+  dmdDot(grid, cx - 1, cy - 3, 1); dmdDot(grid, cx + 1, cy - 3, 1);
+}
+function dmdMoldSplat(grid, cx, cy, r) {
+  for (let a = 0; a < TAU; a += TAU / 7) {
+    const rr = r + ((a * 13) % 3);
+    dmdDot(grid, cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, 1);
+  }
+  dmdCircle(grid, cx, cy, r - 1, 1, true);
+}
+
+function animBugWave() {
+  return {
+    dur: 150, sound: 'bugSquish',
+    render(grid, p, t) {
+      dmdTextCentered(grid, 'BUGS CLEARED', 4, 1);
+      // bugs scatter outward
+      const n = 6;
+      for (let i = 0; i < n; i++) {
+        const ang = i * (TAU / n);
+        const rr = p * 30;
+        const bx = DMD.cols / 2 + Math.cos(ang) * rr;
+        const by = 16 + Math.sin(ang) * rr * 0.5;
+        if (p < 0.85) dmdBug(grid, bx | 0, by | 0);
+      }
+      if (p > 0.6) dmdTextCentered(grid, 'WAVE COMPLETE', 22, ((t >> 3) & 1));
+    },
+  };
+}
+
+function animMoldSplat() {
+  return {
+    dur: 160, sound: 'moldSplat',
+    render(grid, p, t) {
+      // splats appear progressively
+      const spots = 5;
+      for (let i = 0; i < spots; i++) {
+        if (p * spots > i) {
+          const x = 18 + i * 18;
+          const y = 12;
+          dmdMoldSplat(grid, x, y, 2 + ((t >> 2) % 2));
+        }
+      }
+      dmdTextCentered(grid, 'MOLD KILLED', 22, 1);
+    },
+  };
+}
+
+function animShowerOn() {
+  return {
+    dur: 150, sound: 'showerOn',
+    render(grid, p, t) {
+      // showerhead at top
+      dmdRect(grid, DMD.cols / 2 - 6, 2, 12, 3, 1);
+      // water beams falling
+      for (let i = -5; i <= 5; i++) {
+        const x = DMD.cols / 2 + i * 2;
+        const len = Math.min(20, p * 28 + ((t + i) & 3));
+        for (let y = 5; y < 5 + len; y += 2) dmdDot(grid, x | 0, y | 0, 1);
+      }
+      if (p > 0.4) dmdTextCentered(grid, 'SHOWER ON', 22, ((t >> 3) & 1));
+    },
+  };
+}
+
+function animDrainBeast() {
+  return {
+    dur: 180, sound: 'drainBeast',
+    cues: [{ at: 90, snd: 'beastRoar' }],
+    render(grid, p, t) {
+      // a giant eye opens
+      const cx = DMD.cols / 2, cy = 13;
+      const eyeW = Math.round(8 + p * 16);
+      dmdCircle(grid, cx, cy, eyeW, 1, false);
+      const pupil = Math.max(2, Math.round((1 - p) * eyeW * 0.6));
+      dmdCircle(grid, cx, cy, pupil, 1, true);
+      dmdTextCentered(grid, 'DRAIN BEAST', 24, ((t >> 3) & 1));
+    },
+  };
 }
 
 // ---- INITIALS ENTRY -----------------------------------------------------
@@ -1290,6 +1496,21 @@ function buildWormHoler(tdef) {
   // extra-ball score thresholds
   T.extraBallScoreThresholds = [50000, 150000];
 
+  // table-specific bank-completion handler (engine calls this generically)
+  T.onBankComplete = function(group, T) {
+    if (group === 'worm') {
+      T.wormProgress++;
+      activateWormHole(T);
+      dmdPlay(animBlackHole());
+      addScore(3000 * _pb.mult);
+    } else if (group === 'hole') {
+      T.holeProgress++;
+      activateWormHole(T);
+      dmdPlay(animBlackHole());
+      addScore(3000 * _pb.mult);
+    }
+  };
+
   return T;
 }
 
@@ -1313,6 +1534,483 @@ function makeTargetBank(opt) {
   return arr;
 }
 
+/* ==========================================================================
+ * SECTION 10b — SHARED TABLE FRAME
+ * --------------------------------------------------------------------------
+ * All three tables share the same playfield dimensions, plunger location,
+ * and flipper pivot positions. This helper builds the common cabinet frame
+ * (walls, plunger lane, slingshots, return rails, main + mid flippers) so
+ * each unique table builder only has to add its theme-specific elements.
+ *
+ * Returns a base table object with the cabinet pre-built. Callers add:
+ *   bumpers, targets, ramps, wormholes, lanes, lockZone, teleHoles,
+ *   table-systems data (shotSequence, modeDefs, storyBeats, ...),
+ *   plus T.onBankComplete and any custom decor.
+ * ========================================================================== */
+function makeBaseTable(id, tdef, defaults) {
+  const T = {
+    id,
+    name: tdef?.name || defaults.name,
+    subtitle: tdef?.subtitle || defaults.subtitle,
+    colors: tdef?.colors || defaults.colors,
+    staticColliders: [],
+    flippers: [],
+    bumpers: [],
+    targets: [],
+    ramps: [],
+    wormholes: [],       // many tables won't use this, leave empty
+    posts: [],
+    lanes: [],
+    spinners: [],
+    lockZone: null,
+    teleHoles: null,
+    // generic logic state
+    activeHoles: 0,
+    multiballArmed: false,
+    locked: 0,
+    // upper-deck decor items: drawn after ramps so they read as "under glass"
+    upperDeck: [],
+    // bonus animated decor (e.g. shower spray, neon sign blink)
+    decor: [],
+  };
+
+  /* ---- outer walls (cabinet boundary) ---- */
+  const W = WALL;
+  const laneX = PB.W - 46;
+  const laneWallL = PB.W - 70;
+  const laneTop = 210;
+  T.staticColliders.push(
+    // outer top
+    seg(W.L, W.T, 200, W.T, { r:4, role:'wall', color:T.colors.wall }),
+    seg(340, W.T, W.R, W.T, { r:4, role:'wall', color:T.colors.wall }),
+    // angled top-left
+    seg(W.L, W.T, W.L, 200, { r:4, role:'wall', color:T.colors.wall }),
+    seg(W.L, 200, 26, 220, { r:4, role:'wall', color:T.colors.wall }),
+    // left wall + outlane
+    seg(W.L, 220, W.L, 760, { r:4, role:'wall', color:T.colors.wall }),
+    seg(W.L, 760, 70, 870, { r:4, role:'wall', color:T.colors.wall }),
+    // right side & plunger lane
+    seg(W.R, W.T, W.R, 900, { r:4, role:'wall', color:T.colors.wall }),
+    seg(laneWallL, laneTop, laneWallL, 900, { r:4, role:'wall', color:T.colors.wall }),
+    seg(laneWallL, 900, 470, 850, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // top-right hood (curved deflector + scripted feed handle this same as Worm Holer)
+  T.staticColliders.push(
+    seg(360, 26, 440, 46, { r:4, role:'wall', color:T.colors.wall }),
+    seg(440, 46, 488, 120, { r:4, role:'wall', color:T.colors.wall }),
+    seg(488, 120, 470, 196, { r:4, role:'wall', color:T.colors.wall }),
+    seg(470, 196, 372, 250, { r:4, role:'wall', color:T.colors.wall }),
+    seg(514, 206, 476, 180, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  T.laneGate = seg(470, 216, 514, 202, { r:4, role:'gate', color:T.colors.wall, active:true });
+
+  /* ---- plunger ---- */
+  T.plunger = {
+    x: laneX, top: 900, bottom: 944, headRest: 920, headDeep: 940,
+    headY: 920,
+  };
+
+  /* ---- main flippers (identical pivot geometry across all tables) ---- */
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'main', px:176, py:812, len:84, r:9,
+      rest: 0.50, active: 0.50 - 0.95, speed: 0.62 }),
+    makeFlipper({ side:'R', group:'main', px:364, py:812, len:84, r:9,
+      rest: Math.PI - 0.50, active: Math.PI - 0.50 + 0.95, speed: 0.62 }),
+  );
+
+  /* ---- slingshots ---- */
+  T.staticColliders.push(
+    seg(96, 690, 150, 790, { r:6, role:'sling', bounce:1.5, color:T.colors.neon }),
+    seg(444, 690, 390, 790, { r:6, role:'sling', bounce:1.5, color:T.colors.neon }),
+  );
+  T.posts.push(
+    circle(96, 690, 8, { role:'post', color:T.colors.wall }),
+    circle(444, 690, 8, { role:'post', color:T.colors.wall }),
+  );
+  // inlane rails to flipper pivots
+  T.staticColliders.push(
+    seg(150, 790, 176, 812, { r:3, role:'wall', color:T.colors.wall }),
+    seg(390, 790, 364, 812, { r:3, role:'wall', color:T.colors.wall }),
+  );
+
+  return T;
+}
+
+/* ==========================================================================
+ * SECTION 10c — TABLE: COSMIC CLUCKERS
+ * --------------------------------------------------------------------------
+ * Theme: 80s sitcom parody. BLEEB, a green alien chef, runs an Earth chicken
+ * restaurant. The playfield IS the restaurant — dining floor below, an
+ * upper booth deck reachable via ramps, kitchen pass with grill bumpers,
+ * and the FRYER lock zone for the multiball "fryer overflow".
+ *
+ * Unique mechanics:
+ *   - UPPER DECK: real Z-axis ramps lift the ball over decorative booths
+ *     drawn below the ramps. Booth circles are rollover-style targets the
+ *     ball triggers when delivered from above.
+ *   - ORDER drop-target bank (5 letters) advances customer service.
+ *   - TIPS drop-target bank (4 letters) awards jackpots.
+ *   - GRILL bumpers fire sizzle sounds and accelerate during BUMPER FRENZY.
+ *   - Story beats narrate Bleeb running the diner.
+ * ========================================================================== */
+function buildCosmicCluckers(tdef) {
+  const T = makeBaseTable('cosmic_cluckers', tdef, {
+    name: 'COSMIC CLUCKERS',
+    subtitle: "Bleeb's Diner",
+    colors: { bg:'#2a1408', mid:'#5e2a14', neon:'#ffb330', neon2:'#6dd44a',
+              wall:'#9b5a2c', decor:'#ff5a4c' },
+  });
+
+  /* ---- GRILL BUMPERS (3, fan cluster, mid-table) ---- */
+  // These are the diner's grill burners — they pop with sizzle when hit.
+  const grillDefs = [
+    { x: 200, y: 410, r: 26 },   // left burner
+    { x: 320, y: 410, r: 26 },   // right burner
+    { x: 260, y: 318, r: 26 },   // back burner
+  ];
+  for (const bd of grillDefs) {
+    T.bumpers.push({ x: bd.x, y: bd.y, r: bd.r, cooldown:0, flash:0, value: 300, role:'grill' });
+  }
+
+  /* ---- ORDER bank (5 horizontal drop targets, lower mid) ---- */
+  const orderBank = makeTargetBank({
+    word: 'ORDER', x: 116, y: 600, dx: 62, dy: 0, w: 38, h: 28,
+    vertical: false, group: 'order', value: 600,
+  });
+  T.targets.push(...orderBank);
+
+  /* ---- TIPS bank (4 vertical drop targets, right side) ---- */
+  const tipsBank = makeTargetBank({
+    word: 'TIPS', x: 96, y: 230, dx: 0, dy: 36, w: 30, h: 30,
+    vertical: true, group: 'tips', value: 700,
+  });
+  T.targets.push(...tipsBank);
+
+  /* ---- UPPER DECK BOOTHS (rollover circles, drawn through translucent ramp) ---- */
+  // Four booths in the upper deck — when the ball is delivered up here via
+  // a ramp it passes over them and counts as "serving customers".
+  T.upperDeck = [
+    { kind: 'booth', x: 180, y: 200, r: 18, label: '1', served: false, flash: 0 },
+    { kind: 'booth', x: 250, y: 170, r: 18, label: '2', served: false, flash: 0 },
+    { kind: 'booth', x: 320, y: 170, r: 18, label: '3', served: false, flash: 0 },
+    { kind: 'booth', x: 390, y: 200, r: 18, label: '4', served: false, flash: 0 },
+    // Decorative neon sign + plant
+    { kind: 'sign', x: 270, y: 90, w: 220, h: 28, text: "BLEEB'S", blink: 0 },
+    { kind: 'plant', x: 80, y: 110, r: 14 },
+  ];
+
+  /* ---- LOCK ZONE — THE FRYER (top center) ---- */
+  T.lockZone = { x: 270, y: 130, r: 22, active: true, label: 'FRYER' };
+
+  /* ---- RAMPS (two distinct ramps to the upper deck) ---- */
+  // KITCHEN RAMP — left side, climbs over the booths, ejects right inlane
+  T.ramps.push(makeRamp({
+    id: 'kitchen_ramp',
+    path: [
+      { x: 110, y: 640 }, { x: 90, y: 520 }, { x: 110, y: 380 },
+      { x: 170, y: 260 }, { x: 270, y: 180 }, { x: 380, y: 230 },
+      { x: 430, y: 360 }, { x: 430, y: 500 }, { x: 420, y: 640 },
+    ],
+    width: 30, h0: 0, h1: 64, exitBoost: 7, mountSpeed: 7,
+    color: T.colors.neon,
+  }));
+  // BOOTH RAMP — shorter center ramp lifting ball briefly over the booths
+  T.ramps.push(makeRamp({
+    id: 'booth_ramp',
+    path: [
+      { x: 260, y: 540 }, { x: 260, y: 460 }, { x: 230, y: 400 },
+      { x: 260, y: 340 }, { x: 300, y: 320 },
+    ],
+    width: 28, h0: 0, h1: 44, exitBoost: 6, mountSpeed: 6.5,
+    color: T.colors.neon2,
+  }));
+
+  /* ---- MID-TABLE MINI FLIPPERS (kickers below grill) ---- */
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'mid', px:150, py:560, len:54, r:8,
+      rest: 0.45, active: 0.45 - 0.85, speed: 0.7 }),
+    makeFlipper({ side:'R', group:'mid', px:390, py:560, len:54, r:8,
+      rest: Math.PI - 0.45, active: Math.PI - 0.45 + 0.85, speed: 0.7 }),
+  );
+
+  /* ---- ROLLOVER LANES (top) - "ABC" lanes spell out specials of the day ---- */
+  T.lanes.push(
+    { x: 175, y: 86, lit: false, label: 'S' },
+    { x: 270, y: 78, lit: false, label: 'O' },
+    { x: 365, y: 86, lit: false, label: 'D' },  // SOD = special of day
+  );
+
+  /* ---- TIMED HOLE (just one — the back door) -------------------------- */
+  T.teleHoles = [
+    { id: 0, x: 75, y: 410, r: 14, label: 'BACK', open: false, timer: 0,
+      capturedBall: null, captureTimer: 0, holdFrames: 40, iris: 0 },
+  ];
+
+  // game state
+  T.orderProgress = 0;     // ORDERs completed
+  T.tipsProgress = 0;
+  T.boothsServed = 0;
+  T.shotsTakenThisGame = 0;
+
+  /* ---- TABLE-SYSTEMS DATA (consumed by the engine) -------------------- */
+  T.shotSequence = [
+    { id: 'kitchen_ramp', label: 'TO THE KITCHEN', matchType: 'ramp', matchId: 'kitchen_ramp' },
+    { id: 'booth_ramp',   label: 'TO BOOTH ROW',   matchType: 'ramp', matchId: 'booth_ramp' },
+    { id: 'lock',         label: 'INTO THE FRYER', matchType: 'lock', matchId: null },
+    { id: 'kitchen_ramp_2', label: 'BACK TO KITCHEN', matchType: 'ramp', matchId: 'kitchen_ramp' },
+  ];
+  T.shotReward = 4000;
+  T.shotCompleteBonus = 22000;
+
+  T.modeDefs = {
+    grillFrenzy: {
+      label: 'GRILL FRENZY', dur: 900, mult: 5,
+      hookType: 'bumper', storyStart: 'WOK ON FIRE',
+    },
+    tipsRaining: {
+      label: 'TIPS RAINING', dur: 1100, mult: 3,
+      hookType: 'ramp', storyStart: 'CASH POURS DOWN',
+    },
+  };
+  T.modeTriggers = {
+    shotSequenceComplete: 'tipsRaining',
+    bigCombo: 'grillFrenzy',
+  };
+
+  T.storyBeats = {
+    gameStart:    'OPEN THE DINER',
+    firstOrder:   'ORDER UP',
+    fryerLit:     'FRYER IS HOT',
+    bossVisit:    'GORDON DROPS IN',     // sitcom boss trope
+    catchPhrase:  'ZORPLAX SAYS HI',     // Bleeb's catchphrase
+    multiball:    'CUSTOMERS RUSH IN',
+    extraBall:    'BLEEB WINKS',
+    victory:      'EMPLOYEE OF MONTH',
+  };
+
+  T.extraBallScoreThresholds = [45000, 130000];
+
+  // Bank completion handler — sitcom plot beats fire here
+  T.onBankComplete = function(group, T) {
+    if (group === 'order') {
+      T.orderProgress++;
+      addScore(3500 * _pb.mult);
+      dmdPlay(animOrderUp());
+      // first ORDER bank completed = first plot beat
+      if (T.orderProgress === 1) storyBeat('firstOrder', T);
+      // every 3rd ORDER = boss-visit gag
+      if (T.orderProgress % 3 === 0) storyBeatRepeatable('bossVisit', T);
+      // light the fryer for multiball when 2 ORDERs done
+      if (T.orderProgress >= 2 && !T.multiballArmed) {
+        T.multiballArmed = true;
+        storyBeat('fryerLit', T);
+      }
+    } else if (group === 'tips') {
+      T.tipsProgress++;
+      addScore(5000 * _pb.mult);
+      dmdFlash('TIPS COMPLETE', '+' + (5000 * _pb.mult));
+      // tips bank fires Bleeb's catchphrase every 2 completions
+      if (T.tipsProgress % 2 === 0) storyBeatRepeatable('catchPhrase', T);
+    }
+  };
+
+  return T;
+}
+
+/* ==========================================================================
+ * SECTION 10d — TABLE: SHOWER DEFENSE
+ * --------------------------------------------------------------------------
+ * Theme: tower-defense parody set in a bathroom. The player defends against
+ * waves of bugs and mold using bathroom-fixture pinball elements. The
+ * SHOWER toggle is the table's signature mechanic: when ON, a water curtain
+ * activates a one-way deflector at the top that redirects the ball into a
+ * scoring funnel; when OFF, the same path is wide open but no shower bonus.
+ *
+ * Unique mechanics:
+ *   - SHOWER TOGGLE: rollover lit shower lanes flip the shower on/off.
+ *     ON = water-curtain segment is active in physics, deflecting the ball.
+ *   - BUGS bank (4) and MOLD bank (4) - sequential waves. Defeat BUGS to
+ *     trigger MOLD, defeat MOLD to spawn the DRAIN BEAST (lock).
+ *   - SINK FAUCETS as bumpers (HOT + COLD, 2 instead of 3).
+ *   - The TOILET drain is the multiball lock zone.
+ * ========================================================================== */
+function buildShowerDefense(tdef) {
+  const T = makeBaseTable('shower_defense', tdef, {
+    name: 'SHOWER DEFENSE',
+    subtitle: 'Tower Defense Parody',
+    colors: { bg:'#031820', mid:'#0a3848', neon:'#2ee8e8', neon2:'#7ec8ff',
+              wall:'#3f7f8a', decor:'#a8e8e8' },
+  });
+
+  /* ---- SINK FAUCETS (2 bumpers — HOT/COLD) ---- */
+  T.bumpers.push(
+    { x: 200, y: 430, r: 28, cooldown:0, flash:0, value: 350, role:'hot',  label:'H' },
+    { x: 340, y: 430, r: 28, cooldown:0, flash:0, value: 350, role:'cold', label:'C' },
+  );
+  // Sink basin (decorative collider — also acts as a small wall arc)
+  T.staticColliders.push(
+    seg(160, 480, 380, 480, { r:4, role:'wall', color:T.colors.wall }),
+  );
+
+  /* ---- BUGS bank (4 horizontal targets — first wave) ---- */
+  const bugsBank = makeTargetBank({
+    word: 'BUGS', x: 130, y: 620, dx: 60, dy: 0, w: 38, h: 28,
+    vertical: false, group: 'bugs', value: 600,
+  });
+  T.targets.push(...bugsBank);
+
+  /* ---- MOLD bank (4 vertical targets, left side — second wave) ---- */
+  const moldBank = makeTargetBank({
+    word: 'MOLD', x: 78, y: 260, dx: 0, dy: 36, w: 30, h: 30,
+    vertical: true, group: 'mold', value: 800,
+  });
+  T.targets.push(...moldBank);
+
+  /* ---- TOILET LOCK ZONE (top center — multiball drain beast) ---- */
+  T.lockZone = { x: 270, y: 140, r: 22, active: true, label: 'TOILET' };
+
+  /* ---- SHOWER STALL (decorative + the shower-toggle mechanic) --------- */
+  T.shower = {
+    on: false,             // toggled by rollover lanes
+    spray: 0,              // animation phase
+    headX: 132, headY: 90, // showerhead position
+    curtainY: 220,         // where the water curtain hits
+  };
+  // when ON, this collider becomes active and deflects balls leftward into MOLD bank
+  T.showerCurtain = seg(120, 100, 200, 240,
+    { r:3, role:'wall', color:T.colors.neon, active: false });
+  T.staticColliders.push(T.showerCurtain);
+
+  /* ---- RAMPS (real Z-axis) -------------------------------------------- */
+  // DRAIN RAMP — climbs from left sling around to the shower, ejects from showerhead
+  T.ramps.push(makeRamp({
+    id: 'drain_ramp',
+    path: [
+      { x: 110, y: 640 }, { x: 86, y: 500 }, { x: 110, y: 360 },
+      { x: 180, y: 260 }, { x: 270, y: 200 }, { x: 360, y: 220 },
+      { x: 420, y: 320 }, { x: 430, y: 480 }, { x: 420, y: 640 },
+    ],
+    width: 30, h0: 0, h1: 64, exitBoost: 7, mountSpeed: 7,
+    color: T.colors.neon,
+  }));
+  // LOOFAH RAMP — short center scrubber loop
+  T.ramps.push(makeRamp({
+    id: 'loofah_ramp',
+    path: [
+      { x: 270, y: 520 }, { x: 270, y: 430 }, { x: 240, y: 380 },
+      { x: 270, y: 320 }, { x: 310, y: 310 },
+    ],
+    width: 28, h0: 0, h1: 44, exitBoost: 6, mountSpeed: 6.5,
+    color: T.colors.neon2,
+  }));
+
+  /* ---- MID-TABLE MINI FLIPPERS (under sink) --------------------------- */
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'mid', px:150, py:540, len:54, r:8,
+      rest: 0.45, active: 0.45 - 0.85, speed: 0.7 }),
+    makeFlipper({ side:'R', group:'mid', px:390, py:540, len:54, r:8,
+      rest: Math.PI - 0.45, active: Math.PI - 0.45 + 0.85, speed: 0.7 }),
+  );
+
+  /* ---- ROLLOVER LANES (top) — SHOWER toggle lanes --------------------- */
+  // Hitting all three lights the shower; subsequent completion toggles it.
+  T.lanes.push(
+    { x: 175, y: 86, lit: false, label: 'S' },
+    { x: 270, y: 78, lit: false, label: 'O' },
+    { x: 365, y: 86, lit: false, label: 'N' },  // S-O-N = SHOWER ON
+  );
+
+  /* ---- TIMED HOLES — DRAIN PIPES on either side ----------------------- */
+  T.teleHoles = [
+    { id: 0, x: 60,  y: 380, r: 14, label: 'L', open: false, timer: 0,
+      capturedBall: null, captureTimer: 0, holdFrames: 40, iris: 0 },
+    { id: 1, x: 480, y: 380, r: 14, label: 'R', open: false, timer: 0,
+      capturedBall: null, captureTimer: 0, holdFrames: 40, iris: 0 },
+  ];
+
+  // game state
+  T.wave = 1;              // 1=BUGS, 2=MOLD, 3=DRAIN BEAST
+  T.bugsKilled = 0;
+  T.moldKilled = 0;
+  T.beastHits = 0;
+
+  /* ---- TABLE-SYSTEMS DATA -------------------------------------------- */
+  T.shotSequence = [
+    { id: 'drain_ramp',  label: 'HIT THE DRAIN',   matchType: 'ramp', matchId: 'drain_ramp' },
+    { id: 'loofah_ramp', label: 'SCRUB THE LOOFAH',matchType: 'ramp', matchId: 'loofah_ramp' },
+    { id: 'lock',        label: 'FLUSH THE TOILET',matchType: 'lock', matchId: null },
+    { id: 'drain_ramp_2',label: 'DRAIN AGAIN',     matchType: 'ramp', matchId: 'drain_ramp' },
+  ];
+  T.shotReward = 4500;
+  T.shotCompleteBonus = 24000;
+
+  T.modeDefs = {
+    moldWave: {
+      label: 'MOLD WAVE', dur: 1000, mult: 4,
+      hookType: 'bumper', storyStart: 'SCRUB FASTER',
+    },
+    steamCycle: {
+      label: 'STEAM CYCLE', dur: 1200, mult: 2,
+      hookType: 'ramp', storyStart: 'STEAM EVERYWHERE',
+    },
+  };
+  T.modeTriggers = {
+    shotSequenceComplete: 'steamCycle',
+    bigCombo: 'moldWave',
+  };
+
+  T.storyBeats = {
+    gameStart:    'PROTECT THE BATH',
+    bugsCleared:  'BUGS WIPED OUT',
+    moldArrives:  'MOLD ADVANCING',
+    moldCleared:  'BLEACH VICTORIOUS',
+    drainBeast:   'DRAIN BEAST RISES',
+    showerOn:     'WATER FORCE LIVE',
+    multiball:    'EVERY DRAIN ALIVE',
+    extraBall:    'BAR OF SOAP BONUS',
+    victory:      'SPOTLESS CHAMPION',
+  };
+
+  T.extraBallScoreThresholds = [40000, 120000];
+
+  T.onBankComplete = function(group, T) {
+    if (group === 'bugs') {
+      T.bugsKilled++;
+      addScore(3500 * _pb.mult);
+      dmdPlay(animBugWave());
+      if (T.wave === 1) {
+        storyBeat('bugsCleared', T);
+        T.wave = 2;
+        storyBeat('moldArrives', T);
+      }
+    } else if (group === 'mold') {
+      T.moldKilled++;
+      addScore(4500 * _pb.mult);
+      dmdPlay(animMoldSplat());
+      if (T.wave === 2) {
+        storyBeat('moldCleared', T);
+        T.wave = 3;
+        T.multiballArmed = true;
+        storyBeat('drainBeast', T);
+      }
+    }
+  };
+
+  // Shower-toggle hook called from the lane-rollover code below
+  T.onLanesComplete = function(T) {
+    T.shower.on = !T.shower.on;
+    T.showerCurtain.active = T.shower.on;
+    if (T.shower.on) {
+      storyBeatRepeatable('showerOn', T);
+      dmdPlay(animShowerOn());
+    } else {
+      dmdFlash('SHOWER OFF');
+    }
+    snd('shower');
+  };
+
+  return T;
+}
 
 /* ==========================================================================
  * SECTION 11 — COLLIDER ASSEMBLY
@@ -1597,8 +2295,34 @@ function stepBall(ball, T, colliders) {
       ln.lit = true; addScore(150); snd('target');
       if (T.lanes.every(l => l.lit)) {
         T.lanes.forEach(l => l.lit = false);
-        addScore(2500); _pb.mult++; dmdFlash('LANES COMPLETE', 'MULTIPLIER UP');
+        addScore(2500); _pb.mult++;
+        // call table-specific lanes-complete handler if provided (e.g. shower toggle)
+        if (T.onLanesComplete) T.onLanesComplete(T);
+        else dmdFlash('LANES COMPLETE', 'MULTIPLIER UP');
         snd('group');
+      }
+    }
+  }
+
+  /* --- upper-deck booths (only counted when ball is on a ramp above) --- */
+  if (T.upperDeck && ball.onRamp && ball.z > 30) {
+    for (const u of T.upperDeck) {
+      if (u.kind !== 'booth' || u.served) continue;
+      if (dist(ball.x, ball.y, u.x, u.y) < u.r + ball.r) {
+        u.served = true; u.flash = 30;
+        T.boothsServed = (T.boothsServed || 0) + 1;
+        addScore(2500 * _pb.mult);
+        dmdFlash('TABLE ' + u.label + ' SERVED', '+' + (2500 * _pb.mult));
+        snd('orderUp');
+        // all booths served = jackpot
+        if (T.upperDeck.filter(x => x.kind === 'booth').every(x => x.served)) {
+          addScore(15000 * _pb.mult);
+          dmdFlash('ALL TABLES SERVED', '+15000');
+          // reset for next round
+          setTimeout(() => {
+            T.upperDeck.forEach(x => { if (x.kind === 'booth') x.served = false; });
+          }, 1500);
+        }
       }
     }
   }
@@ -2054,24 +2778,18 @@ function onLitHoleCapture(hole, T) {
 }
 
 /* ==========================================================================
- * SECTION 16 — WORM HOLER GAME LOGIC
+ * SECTION 16 — TABLE LOGIC DISPATCH
+ * --------------------------------------------------------------------------
+ * Generic event handler. The specific bank-completion behavior is provided
+ * by each table as T.onBankComplete(group, T) — keeps the engine generic.
  * ========================================================================== */
 function onTargetHit(t, T) {
   // count completion of a bank
   const bank = T.targets.filter(x => x.group === t.group);
   const done = bank.every(x => x.hit);
   if (done) {
-    if (t.group === 'worm') {
-      T.wormProgress++;
-      activateWormHole(T);
-      dmdPlay(animBlackHole());
-      addScore(3000 * _pb.mult);
-    } else if (t.group === 'hole') {
-      T.holeProgress++;
-      activateWormHole(T);
-      dmdPlay(animBlackHole());
-      addScore(3000 * _pb.mult);
-    }
+    // table-specific bank-completion handler (optional)
+    if (T.onBankComplete) T.onBankComplete(t.group, T);
     snd('group');
     // reset the bank after a beat (drop targets pop back up)
     setTimeout(() => { bank.forEach(x => { x.hit = false; }); }, 900);
@@ -2546,6 +3264,13 @@ function drawPlayfield() {
   }
   ctx.globalAlpha = 1;
 
+  // ---- upper-deck decor (drawn FIRST so ramps render over them as glass) ----
+  if (T.upperDeck && T.upperDeck.length) {
+    for (const u of T.upperDeck) drawUpperDeckItem(ctx, u, T);
+  }
+  // ---- shower spray (Shower Defense) — drawn under ramps so ball is visible ----
+  if (T.shower) drawShowerSpray(ctx, T);
+
   // ---- ramps: draw as elevated translucent channels (drawn first, under) ----
   for (const ramp of T.ramps) drawRamp(ctx, ramp);
 
@@ -2562,7 +3287,7 @@ function drawPlayfield() {
     ctx.strokeStyle = T.lockZone.active ? T.colors.neon : '#555';
     ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
     ctx.fillStyle = '#fff'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
-    ctx.fillText('LOCK', T.lockZone.x, T.lockZone.y + 3);
+    ctx.fillText(T.lockZone.label || 'LOCK', T.lockZone.x, T.lockZone.y + 3);
   }
 
   // ---- rollover lanes ----
@@ -2675,6 +3400,92 @@ function drawRamp(ctx, ramp) {
   ctx.arc(e.x, e.y, 6, 0, TAU);
   ctx.fill();
   ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+/* ==========================================================================
+ * UPPER-DECK and TABLE-SPECIFIC DECOR
+ * --------------------------------------------------------------------------
+ * Draws decorative items in the upper part of the playfield BEFORE ramps,
+ * so that translucent ramps render over them — the ball travelling on the
+ * ramp looks like it's gliding over the booths/sink/etc. Below-ramp items
+ * remain readable.
+ * ========================================================================== */
+function drawUpperDeckItem(ctx, u, T) {
+  ctx.save();
+  if (u.kind === 'booth') {
+    // booth = a small table-circle with a number
+    ctx.beginPath();
+    ctx.arc(u.x, u.y, u.r, 0, TAU);
+    ctx.fillStyle = u.served ? 'rgba(109,212,74,0.45)' : 'rgba(255,179,48,0.20)';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = u.served ? T.colors.neon2 : T.colors.neon;
+    ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(u.label, u.x, u.y + 4);
+  } else if (u.kind === 'sign') {
+    // neon diner sign — blinking
+    const blink = ((_pb.tick >> 4) & 1) ? 1 : 0.6;
+    ctx.shadowColor = T.colors.neon; ctx.shadowBlur = 14 * blink;
+    ctx.strokeStyle = T.colors.neon; ctx.lineWidth = 2;
+    ctx.strokeRect(u.x - u.w/2, u.y - u.h/2, u.w, u.h);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = T.colors.neon;
+    ctx.font = 'bold 18px "Courier New", monospace'; ctx.textAlign = 'center';
+    ctx.globalAlpha = blink;
+    ctx.fillText(u.text || '', u.x, u.y + 6);
+    ctx.globalAlpha = 1;
+  } else if (u.kind === 'plant') {
+    // little potted plant
+    ctx.fillStyle = '#5a3a20';
+    ctx.fillRect(u.x - u.r * 0.7, u.y, u.r * 1.4, u.r * 0.8);
+    ctx.fillStyle = T.colors.neon2 || '#6dd44a';
+    ctx.beginPath();
+    for (let a = 0; a < TAU; a += 0.6) {
+      ctx.moveTo(u.x, u.y);
+      ctx.lineTo(u.x + Math.cos(a) * u.r, u.y - Math.abs(Math.sin(a)) * u.r);
+    }
+    ctx.strokeStyle = T.colors.neon2 || '#6dd44a';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawShowerSpray(ctx, T) {
+  const sh = T.shower;
+  if (!sh) return;
+  ctx.save();
+  // showerhead
+  ctx.fillStyle = '#9eb5c0';
+  ctx.fillRect(sh.headX - 22, sh.headY - 6, 44, 10);
+  ctx.fillRect(sh.headX - 2, sh.headY - 14, 4, 10); // pipe up
+  // spray when ON: animated water beams
+  if (sh.on) {
+    sh.spray = (sh.spray + 0.25) % 1;
+    ctx.strokeStyle = hexA(T.colors.neon, 0.55);
+    ctx.lineWidth = 2;
+    for (let i = -3; i <= 3; i++) {
+      const x = sh.headX + i * 7;
+      const startY = sh.headY + 4;
+      const len = 110 + Math.sin(_pb.tick * 0.15 + i) * 8;
+      const drop = ((sh.spray + i * 0.1) % 1) * 30;
+      ctx.beginPath();
+      ctx.moveTo(x, startY + drop);
+      ctx.lineTo(x - 6, startY + drop + len * 0.6);
+      ctx.stroke();
+    }
+    // tub puddle glow
+    ctx.fillStyle = hexA(T.colors.neon, 0.18);
+    ctx.beginPath();
+    ctx.ellipse(sh.headX, sh.curtainY, 60, 12, 0, 0, TAU);
+    ctx.fill();
+  }
+  // wave-status decor: a row of mini icons showing remaining waves
+  ctx.fillStyle = T.colors.decor || '#a8e8e8';
+  ctx.font = '10px monospace'; ctx.textAlign = 'left';
+  ctx.fillText('WAVE ' + (T.wave || 1), 460, 30);
   ctx.restore();
 }
 
@@ -3147,10 +3958,12 @@ function saveCredits(n) {
  * ========================================================================== */
 function buildTable(id, tdef) {
   switch (id) {
-    case 'worm_holer':    return buildWormHoler(tdef);
-    case 'barfs_house':   return { placeholder: true, id, name: tdef?.name || "BARF'S HOUSE" };
-    case 'shower_defense':return { placeholder: true, id, name: tdef?.name || 'SHOWER DEFENSE' };
-    default:              return buildWormHoler(tdef);
+    case 'worm_holer':     return buildWormHoler(tdef);
+    case 'cosmic_cluckers':return buildCosmicCluckers(tdef);
+    case 'shower_defense': return buildShowerDefense(tdef);
+    // legacy id kept so old links still work
+    case 'barfs_house':    return buildCosmicCluckers(tdef);
+    default:               return buildWormHoler(tdef);
   }
 }
 

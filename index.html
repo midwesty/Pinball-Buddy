@@ -85,7 +85,7 @@
   <header>
     <h1>PINBALL <span class="b">BUDDY</span></h1>
     <div class="tag">SELECT YOUR TABLE</div>
-    <div class="ver" id="ver">v0.006</div>
+    <div class="ver" id="ver">v0.007</div>
   </header>
 
   <div class="grid" id="grid"><!-- cards injected --></div>
@@ -107,13 +107,15 @@
   // accent colors per table for the lobby cards
   const ACCENTS = {
     worm_holer:    { accent:'#ff3ea5', glow:'rgba(255,62,165,.5)' },
-    barfs_house:   { accent:'#ff8a1e', glow:'rgba(255,138,30,.5)' },
-    shower_defense:{ accent:'#28e0e0', glow:'rgba(40,224,224,.5)' },
+    cosmic_cluckers:{ accent:'#ffb330', glow:'rgba(255,179,48,.5)' },
+    shower_defense:{ accent:'#2ee8e8', glow:'rgba(46,232,232,.5)' },
+    barfs_house:   { accent:'#ffb330', glow:'rgba(255,179,48,.5)' }, // legacy alias
   };
   const DESCS = {
     worm_holer:'Open all four worm holes, chain quantum jumps, and lock a ball for Entanglement Multiball.',
-    barfs_house:"Serve chickens at Barf's intergalactic diner. Drop-target banks, kitchen ramps, laugh-track combos.",
-    shower_defense:'Defend your shower from the spreading grime. Water drops, drain ramps, soap-scum jackpots.',
+    cosmic_cluckers:"Run Bleeb's alien-chef chicken diner. ORDER targets, upper-deck booths, grill bumpers, FRYER multiball.",
+    shower_defense:'Defend your bathroom from BUGS and MOLD waves. Toggle the shower, fight the DRAIN BEAST.',
+    barfs_house:"Run Bleeb's alien-chef chicken diner. ORDER targets, upper-deck booths, grill bumpers, FRYER multiball.",
   };
 
   async function build() {
@@ -126,8 +128,8 @@
       // fallback if JSON fails to load (e.g. file:// without server)
       tables = [
         { id:'worm_holer', name:'WORM HOLER', subtitle:'Quantum Pinball', status:'playable' },
-        { id:'barfs_house', name:"BARF'S HOUSE", subtitle:'Intergalactic Diner', status:'placeholder' },
-        { id:'shower_defense', name:'SHOWER DEFENSE', subtitle:'Tower Defense Parody', status:'placeholder' },
+        { id:'cosmic_cluckers', name:'COSMIC CLUCKERS', subtitle:"Bleeb's Diner", status:'playable' },
+        { id:'shower_defense', name:'SHOWER DEFENSE', subtitle:'Tower Defense Parody', status:'playable' },
       ];
     }
     const grid = document.getElementById('grid');
