@@ -4,6 +4,8 @@
  * v0.004.1  — lane-feed arc, top-right hood redesign, flipper-gap drain fix
  * v0.005    — swept flipper collision, DMD animations+attract reel, initials
  *             entry, high-score table, credit/match/free-game, teleport holes
+ * v0.006    — DMD layout fix, shot sequence, modes, ramp combos, extra balls,
+ *             lit teleport holes, story beats (all table-data-driven for reuse)
  *
  * Single-file ES module. Exports openPinball().
  *
@@ -79,13 +81,13 @@ const PB = {
   RESTITUTION: 0.36,        // generic wall bounciness
   FRICTION: 0.992,          // per-frame velocity retention (rolling drag)
   SEP_EPS: 0.6,             // separation pushed out after a contact
-  DMD_W: 540, DMD_H: 132,   // dot-matrix display canvas px
+  DMD_W: 540, DMD_H: 168,   // dot-matrix display canvas px (extra padding around 26-row grid)
 };
 
 // playfield bounding walls (used by every table)
 const WALL = { L: 26, R: 514, T: 26, DRAIN_Y: 944 };
 
-export const PB_VERSION = 'v0.005';
+export const PB_VERSION = 'v0.006';
 
 /* ==========================================================================
  * SECTION 3 — COLLIDER PRIMITIVES
@@ -277,6 +279,17 @@ function freshPB() {
     endQualifies: false,
     matchWon: false,
     pendingFreeGame: null,
+    // shot sequence (table-driven)
+    shot: { idx: 0, hits: 0, completedThisGame: 0 },
+    // active mode (table-driven, exclusive)
+    mode: { name: null, framesLeft: 0, mult: 1, hookType: null, label: '' },
+    // ramp combo tracking (chain of distinct ramps within window)
+    rampCombo: { lastId: null, timer: 0, count: 0 },
+    // extra balls earned this game (added to ballsTotal)
+    extraBallsEarned: 0,
+    extraBallLitForHole: null,    // teleport-hole-driven extra ball, if armed
+    // story beats already shown this game (don't repeat)
+    storyShown: {},
   };
 }
 
@@ -370,6 +383,14 @@ function snd(name) {
     case 'cursor':   tone(520, 0.04, 'square', 0.08); break;
     case 'confirm':  tone(784, 0.12, 'square', 0.14, 1046); break;
     case 'holeOpen': tone(440, 0.14, 'sine', 0.11, 760); break;
+    // ---- table-systems cues ---------------------------------------------
+    case 'shotLit':         tone(880, 0.14, 'square', 0.14, 1320); break;
+    case 'shotSequenceWin': [523,659,784,1046,1318,1568].forEach((f,i)=>setTimeout(()=>tone(f,0.18,'square',0.16),i*70)); break;
+    case 'modeStart':       [392,523,659,880].forEach((f,i)=>setTimeout(()=>tone(f,0.2,'triangle',0.16),i*80)); break;
+    case 'modeEnd':         tone(220, 0.3, 'sawtooth', 0.13, 110); break;
+    case 'combo':           tone(659, 0.12, 'square', 0.14, 988); break;
+    case 'extraBall':       [523,659,784,1046,1318].forEach((f,i)=>setTimeout(()=>tone(f,0.22,'sine',0.16),i*90)); break;
+    case 'story':           tone(330, 0.12, 'triangle', 0.10, 440); break;
     default: break;
   }
 }
@@ -848,7 +869,8 @@ function attractScores(grid, p, t, table) {
   const startY = 11 - Math.floor((p * tbl.length * rowH)) % (tbl.length * rowH);
   for (let i = 0; i < tbl.length; i++) {
     const y = startY + i * rowH;
-    if (y < 4 || y > DMD.rows - 2) continue;
+    // clip BELOW the header (row 2-8) and within the grid
+    if (y < 11 || y > DMD.rows - 8) continue;
     const e = tbl[i];
     dmdText(grid, (i + 1) + '.' + e.name, 6, y, 1);
     const sc = shortNum(e.score);
@@ -1227,6 +1249,47 @@ function buildWormHoler(tdef) {
     { x: 175, y: 86, lit: false }, { x: 270, y: 78, lit: false }, { x: 365, y: 86, lit: false },
   );
 
+  /* ---- table-systems data (consumed by SECTION 15b engines) ----------- */
+  // shot sequence — 5 lit shots that cycle. Player must hit them in order.
+  T.shotSequence = [
+    { id: 'left_orbit',    label: 'HIT LEFT ORBIT',    matchType: 'ramp',     matchId: 'left_orbit' },
+    { id: 'upper_wormhole_l', label: 'HIT NW WORMHOLE', matchType: 'wormhole', matchId: 0 },
+    { id: 'center_loop',   label: 'HIT CENTER LOOP',   matchType: 'ramp',     matchId: 'center_loop' },
+    { id: 'upper_wormhole_r', label: 'HIT NE WORMHOLE', matchType: 'wormhole', matchId: 1 },
+    { id: 'lock',          label: 'HIT LOCK FOR JUMP', matchType: 'lock',     matchId: null },
+  ];
+  T.shotReward = 5000;
+  T.shotCompleteBonus = 25000;
+
+  // modes — short scoring frenzies triggered by milestones
+  T.modeDefs = {
+    wormholeRush: {
+      label: 'WORMHOLE RUSH', dur: 1200, mult: 3,
+      hookType: 'wormhole', storyStart: 'BEND SPACE NOW',
+    },
+    bumperFrenzy: {
+      label: 'BUMPER FRENZY', dur: 900, mult: 5,
+      hookType: 'bumper', storyStart: 'PARTICLE STORM',
+    },
+  };
+  T.modeTriggers = {
+    shotSequenceComplete: 'wormholeRush',
+    bigCombo: 'bumperFrenzy',
+  };
+
+  // story beats — DMD flashes at narrative moments
+  T.storyBeats = {
+    gameStart:     'ALIGN THE WORMHOLES',
+    twoWormholes:  'GRAVITY DISTORTS',
+    fourWormholes: 'PREPARE FOR JUMP',
+    multiball:     'QUANTUM ENTANGLEMENT',
+    extraBall:     'BONUS DIMENSION',
+    victory:       'YOU HAVE BENT SPACE',
+  };
+
+  // extra-ball score thresholds
+  T.extraBallScoreThresholds = [50000, 150000];
+
   return T;
 }
 
@@ -1356,6 +1419,11 @@ function rideRamp(ball) {
     ball.vx = rp.tx * ej; ball.vy = rp.ty * ej;
     ball.onRamp = null;
     snd('rampDown');
+    // table-systems hooks
+    onShotEvent('ramp', ramp.id, _table);
+    onComboRamp(ramp.id, _table);
+    addScore(1500 * modeMult('ramp') * _pb.mult);
+    checkExtraBallScoreThresholds(_table);
     if (ramp.onEject) ramp.onEject(ball);
     return;
   }
@@ -1709,8 +1777,9 @@ function respondCollision(ball, hit, T) {
         const kick = 7.5;
         ball.vx += nx * kick;
         ball.vy += ny * kick;
-        addScore(b.value * _pb.mult);
+        addScore(b.value * _pb.mult * modeMult('bumper'));
         bumpCombo();
+        onShotEvent('bumper', b.id || 'any', _table);
         _pb.shake = Math.min(8, _pb.shake + 4);
         snd('bumper');
       }
@@ -1786,7 +1855,11 @@ function respondCollision(ball, hit, T) {
 /* ==========================================================================
  * SECTION 15 — SCORING & COMBO
  * ========================================================================== */
-function addScore(n) { _pb.score += Math.round(n); }
+function addScore(n) {
+  _pb.score += Math.round(n);
+  // central extra-ball threshold check (covers every scoring path)
+  if (_table && _table.extraBallScoreThresholds) checkExtraBallScoreThresholds(_table);
+}
 function bumpCombo() {
   _pb.combo++;
   _pb.comboTimer = 90;
@@ -1794,6 +1867,189 @@ function bumpCombo() {
     dmdFlash(_pb.combo + 'X COMBO', '+' + (_pb.combo * 200));
     addScore(_pb.combo * 200);
     snd('group');
+  }
+}
+
+/* ==========================================================================
+ * SECTION 15b — TABLE-AGNOSTIC GAME SYSTEMS
+ * --------------------------------------------------------------------------
+ * These systems are driven by *table data*, not table-specific code. Each
+ * table declares its own shot sequence, mode definitions, story beats, and
+ * extra-ball rules. The engine consumes those declarations the same way for
+ * every table, so the second and third games can reuse all six systems by
+ * writing data — no engine changes.
+ *
+ *   T.shotSequence    : [ { id, label, matchType, matchId } ]
+ *   T.shotReward      : score per lit-shot hit (default 5000)
+ *   T.shotCompleteBonus : score awarded for completing the full sequence
+ *   T.modeDefs        : { modeName: { label, dur, mult, hookType, ... } }
+ *   T.storyBeats      : { eventName: 'DMD TEXT' }
+ *   T.extraBallScoreThresholds : [score values that award an extra ball]
+ *
+ *   Event hooks call:
+ *     onShotEvent('ramp'|'wormhole'|'bumper'|'lock'|'target', id, T)
+ *     onComboRamp(rampId, T)
+ *     onScoreChanged(T)
+ *     storyBeat(eventName, T)
+ * ========================================================================== */
+
+// ---- SHOT SEQUENCE ------------------------------------------------------
+function currentShot(T) {
+  if (!T.shotSequence || !T.shotSequence.length) return null;
+  return T.shotSequence[_pb.shot.idx % T.shotSequence.length];
+}
+function onShotEvent(matchType, matchId, T) {
+  const shot = currentShot(T);
+  if (!shot) return false;
+  if (shot.matchType !== matchType) return false;
+  // matchId can be exact value, array of allowed values, or null = any of type
+  if (shot.matchId !== null && shot.matchId !== undefined) {
+    if (Array.isArray(shot.matchId)) {
+      if (!shot.matchId.includes(matchId)) return false;
+    } else if (shot.matchId !== matchId) return false;
+  }
+  // shot matched!
+  const reward = (T.shotReward || 5000) * _pb.mult;
+  addScore(reward);
+  _pb.shot.hits++;
+  _pb.shot.idx++;
+  dmdFlash('SHOT LIT  +' + reward);
+  snd('shotLit');
+  // completed full sequence?
+  if (_pb.shot.idx % T.shotSequence.length === 0) {
+    _pb.shot.completedThisGame++;
+    const bonus = (T.shotCompleteBonus || 25000) * _pb.mult;
+    addScore(bonus);
+    dmdFlash('SEQUENCE COMPLETE', '+' + bonus);
+    snd('shotSequenceWin');
+    // trigger configured reward-mode if any
+    if (T.modeTriggers && T.modeTriggers.shotSequenceComplete) {
+      startMode(T.modeTriggers.shotSequenceComplete, T);
+    }
+  }
+  return true;
+}
+
+// ---- MODES --------------------------------------------------------------
+function startMode(name, T) {
+  const def = T.modeDefs && T.modeDefs[name];
+  if (!def) return;
+  if (_pb.mode.name) return; // already running, exclusive
+  _pb.mode = {
+    name, framesLeft: def.dur, mult: def.mult || 2,
+    hookType: def.hookType, label: def.label || name.toUpperCase(),
+  };
+  if (def.storyStart) {
+    dmdFlash(def.label || name.toUpperCase(), def.storyStart);
+  } else {
+    dmdFlash(def.label || name.toUpperCase(), 'MODE STARTED');
+  }
+  snd('modeStart');
+}
+function stepMode(T) {
+  if (!_pb.mode.name) return;
+  _pb.mode.framesLeft--;
+  if (_pb.mode.framesLeft <= 0) {
+    dmdFlash(_pb.mode.label, 'MODE ENDS');
+    _pb.mode = { name: null, framesLeft: 0, mult: 1, hookType: null, label: '' };
+    snd('modeEnd');
+  }
+}
+// returns the score multiplier currently applicable to an event of a given type
+function modeMult(hookType) {
+  if (_pb.mode.name && _pb.mode.hookType === hookType) return _pb.mode.mult;
+  return 1;
+}
+
+// ---- RAMP COMBO ---------------------------------------------------------
+function onComboRamp(rampId, T) {
+  const RC = _pb.rampCombo;
+  if (RC.timer > 0 && RC.lastId && RC.lastId !== rampId) {
+    RC.count++;
+    const mult = RC.count + 1;
+    const bonus = 2000 * mult * _pb.mult;
+    addScore(bonus);
+    dmdFlash('RAMP COMBO X' + mult, '+' + bonus);
+    snd('combo');
+    // big-combo reward-mode hook
+    if (RC.count >= 3 && T.modeTriggers && T.modeTriggers.bigCombo) {
+      startMode(T.modeTriggers.bigCombo, T);
+    }
+  } else {
+    RC.count = 0;
+  }
+  RC.lastId = rampId;
+  RC.timer = 180; // 3-second window to chain
+}
+function stepRampCombo() {
+  if (_pb.rampCombo.timer > 0) {
+    _pb.rampCombo.timer--;
+    if (_pb.rampCombo.timer === 0) { _pb.rampCombo.count = 0; _pb.rampCombo.lastId = null; }
+  }
+}
+
+// ---- EXTRA BALL ---------------------------------------------------------
+function checkExtraBallScoreThresholds(T) {
+  if (!T.extraBallScoreThresholds) return;
+  for (const threshold of T.extraBallScoreThresholds) {
+    const key = 'eb_threshold_' + threshold;
+    if (_pb.score >= threshold && !_pb.storyShown[key]) {
+      _pb.storyShown[key] = true;
+      awardExtraBall(T, 'SCORE');
+    }
+  }
+}
+function awardExtraBall(T, reason) {
+  _pb.extraBallsEarned++;
+  _pb.ballsTotal++;
+  dmdFlash('EXTRA BALL', reason || 'AWARDED');
+  storyBeat('extraBall', T);
+  snd('extraBall');
+}
+
+// ---- STORY BEATS --------------------------------------------------------
+function storyBeat(eventName, T) {
+  if (!T.storyBeats || !T.storyBeats[eventName]) return;
+  if (_pb.storyShown[eventName]) return;
+  _pb.storyShown[eventName] = true;
+  dmdFlash(T.storyBeats[eventName]);
+  snd('story');
+}
+// some beats are repeatable (e.g. mode trigger every time)
+function storyBeatRepeatable(eventName, T) {
+  if (!T.storyBeats || !T.storyBeats[eventName]) return;
+  dmdFlash(T.storyBeats[eventName]);
+  snd('story');
+}
+
+// ---- LIT TELEPORT-HOLE OBJECTIVES ---------------------------------------
+// Light specific holes when conditions are met. A captured ball in a lit
+// hole gets the bonus reward attached to that hole.
+function updateLitHoles(T) {
+  if (!T.teleHoles) return;
+  // hole D ('secret') lights for SUPER on final ball if score >= threshold
+  const last = (_pb.ball === _pb.ballsTotal);
+  const dHole = T.teleHoles.find(h => h.label === 'D');
+  if (dHole) {
+    dHole.lit = last && _pb.score >= 30000 && !_pb.storyShown['superClaimed'];
+    dHole.litReward = 'super';
+  }
+  // hole C lights during WORMHOLE RUSH mode
+  const cHole = T.teleHoles.find(h => h.label === 'C');
+  if (cHole) {
+    cHole.lit = (_pb.mode.name === 'wormholeRush');
+    cHole.litReward = 'rampBoost';
+  }
+}
+function onLitHoleCapture(hole, T) {
+  if (!hole.lit) return;
+  if (hole.litReward === 'super') {
+    _pb.storyShown['superClaimed'] = true;
+    awardExtraBall(T, 'SUPER JACKPOT');
+    addScore(50000 * _pb.mult);
+  } else if (hole.litReward === 'rampBoost') {
+    addScore(10000 * _pb.mult);
+    dmdFlash('RAMP BOOST', '+10000');
   }
 }
 
@@ -1832,8 +2088,11 @@ function activateWormHole(T) {
       break;
     }
   }
+  // story beats at progression milestones
+  if (T.activeHoles === 2) storyBeat('twoWormholes', T);
   if (T.activeHoles >= 4 && !T.multiballArmed) {
     T.multiballArmed = true;
+    storyBeat('fourWormholes', T);
     dmdFlash('WORMHOLES ALIGNED', 'LOCK BALL FOR MULTIBALL');
   }
 }
@@ -1841,7 +2100,9 @@ function activateWormHole(T) {
 function onWormHoleEnter(ball, wh, T) {
   // teleport ball to a random OTHER active hole
   const others = T.wormholes.filter(h => h.active && h !== wh);
-  addScore(1500 * _pb.mult);
+  addScore(1500 * _pb.mult * modeMult('wormhole'));
+  onShotEvent('wormhole', wh.idx, T);
+  checkExtraBallScoreThresholds(T);
   snd('wormhole');
   _pb.shake = 8;
   if (others.length === 0) {
@@ -1867,6 +2128,7 @@ function onBallLock(ball, T) {
     T.lockZone.active = false;
     T.multiballArmed = false;
     dmdPlay(animMultiball());
+    storyBeat('multiball', T);
     _pb.mult = Math.max(_pb.mult, 2);
     // ball that entered is re-ejected, plus 2 more spawn
     ejectFromLock(ball, T);
@@ -1880,6 +2142,7 @@ function onBallLock(ball, T) {
   } else {
     // not armed: lock just scores + kicks ball out
     addScore(2000 * _pb.mult);
+    onShotEvent('lock', null, T);
     dmdPlay(animBallLock());
     ejectFromLock(ball, T);
   }
@@ -1938,6 +2201,8 @@ function resetTeleHoles(T) {
 function stepTeleHoles(T) {
   const stage = teleHoleStage();
   const cfg = TELE_STAGE_CFG[stage];
+  // refresh lit-hole assignments each frame (cheap)
+  updateLitHoles(T);
 
   for (const h of T.teleHoles) {
     // animate iris (visual smoothing)
@@ -1999,6 +2264,7 @@ function captureBallInTeleHole(ball, hole, T) {
   // mark ball so physics skips it while captured
   ball._captured = true;
   addScore(500 * _pb.mult);
+  onLitHoleCapture(hole, T);
   dmdPlay(animTeleporter());
 }
 
@@ -2043,6 +2309,8 @@ function startGame(usingCredit = false) {
   resetTableLogic(_table);
   // game-start cutscene on the DMD, then hand control back to play readout
   dmdPlayExclusive(animGameStart(_table));
+  // queue the gameStart story beat after the cutscene so the player sees it
+  setTimeout(() => { if (_running) storyBeat('gameStart', _table); }, 2600);
   spawnBallInLane();
 }
 function resetTableLogic(T) {
@@ -2094,6 +2362,7 @@ function endGame() {
   const id = _table.id;
   const isHigh = _pb.score > _pb.highScore;
   if (_pb.score > _pb.highScore) _pb.highScore = _pb.score;
+  if (isHigh) storyBeat('victory', _table);
   _pb.endStage = 'gameover';
   _pb.endQualifies = qualifiesForTable(id, _pb.score);
   dmdPlayExclusive(animGameOver(_table, _pb.score, isHigh));
@@ -2194,6 +2463,8 @@ function tick(now) {
     for (const wh of _table.wormholes) { wh.swirl += 0.08; }
     // timed teleport holes open/close + capture
     if (_table.teleHoles) stepTeleHoles(_table);
+    stepMode(_table);
+    stepRampCombo();
 
     for (const ball of _pb.balls) stepBall(ball, _table, colliders);
 
@@ -2490,6 +2761,18 @@ function drawTeleHole(ctx, h, T) {
   ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
   ctx.fillText(h.label, h.x, h.y + 3);
 
+  // LIT indicator: pulsing ring when this hole offers a special reward
+  if (h.lit) {
+    const pulse = 1 + 0.4 * Math.sin(_pb.tick * 0.18);
+    ctx.beginPath();
+    ctx.arc(h.x, h.y, (h.r + 6) * pulse, 0, TAU);
+    ctx.strokeStyle = h.litReward === 'super' ? '#ffd700' : '#ff3ea5';
+    ctx.lineWidth = 2;
+    ctx.shadowColor = ctx.strokeStyle; ctx.shadowBlur = 10;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
   // captured ball indicator: a small pulsing dot
   if (h.capturedBall) {
     ctx.beginPath();
@@ -2734,14 +3017,34 @@ function drawDMD() {
       dmdTextCentered(grid, 'BALL LOST', 6, 1);
       dmdTextCentered(grid, 'BALL ' + _pb.ball, 16, 1);
     } else {
-      // PLAY: score big, ball + mult on a status line
+      // PLAY: score top-right, ball top-left, shot label middle,
+      // mode timer or combo bottom, multiball + credits aux row
       const scoreStr = shortNum(_pb.score);
-      dmdText(grid, scoreStr, Math.max(2, DMD.cols - scoreStr.length * 6 - 2), 3, 1);
-      dmdText(grid, 'BALL ' + _pb.ball + '/' + _pb.ballsTotal, 2, 3, 1);
-      dmdText(grid, 'X' + _pb.mult, 2, 14, 1);
-      if (_pb.combo > 1) dmdText(grid, 'COMBO ' + _pb.combo, 30, 14, 1);
-      if (_pb.balls.length > 1) dmdText(grid, _pb.balls.length + ' BALLS', 2, 21, ((_pb.dmd.t>>3)&1));
-      if (_pb.credits > 0) dmdText(grid, 'CR ' + _pb.credits, DMD.cols - 30, 21, 1);
+      dmdText(grid, scoreStr, Math.max(2, DMD.cols - scoreStr.length * 6 - 2), 1, 1);
+      dmdText(grid, 'BALL ' + _pb.ball + '/' + _pb.ballsTotal, 2, 1, 1);
+
+      // CURRENT SHOT (centered, prominent)
+      const shot = currentShot(_table);
+      if (shot && !_pb.mode.name) {
+        dmdTextCentered(grid, shot.label.substring(0, 16), 10, ((_pb.dmd.t>>3)&1) ? 1 : 1);
+      }
+      // MODE BANNER (replaces shot label while active)
+      if (_pb.mode.name) {
+        dmdTextCentered(grid, _pb.mode.label.substring(0, 16), 10, 1);
+        const secs = Math.ceil(_pb.mode.framesLeft / 60);
+        dmdTextCentered(grid, secs + 'S  X' + _pb.mode.mult, 17, ((_pb.dmd.t>>2)&1));
+      } else if (_pb.rampCombo.count > 0) {
+        dmdTextCentered(grid, 'COMBO X' + (_pb.rampCombo.count + 1), 17, ((_pb.dmd.t>>2)&1));
+      } else {
+        // status row: mult / combo / balls / credits
+        dmdText(grid, 'X' + _pb.mult, 2, 17, 1);
+        if (_pb.combo > 1) dmdText(grid, 'CMB ' + _pb.combo, 20, 17, 1);
+        if (_pb.balls.length > 1) dmdText(grid, _pb.balls.length + ' BALLS', 50, 17, ((_pb.dmd.t>>3)&1));
+        if (_pb.credits > 0) dmdText(grid, 'CR ' + _pb.credits, DMD.cols - 30, 17, 1);
+      }
+      // EB indicator if a lit hole is offering an extra ball
+      const ebLit = _table.teleHoles && _table.teleHoles.some(h => h.lit && h.litReward === 'super');
+      if (ebLit) dmdTextCentered(grid, 'HOLE D LIT - SUPER', 22, ((_pb.dmd.t>>3)&1));
     }
   }
 
@@ -2936,7 +3239,7 @@ function buildUI() {
 
 function fitCanvas() {
   if (!_pfCanvas) return;
-  const avail = window.innerHeight - 240; // room for dmd + controls
+  const avail = window.innerHeight - 270; // room for taller dmd + controls
   const scale = Math.min(1, avail / PB.H, (window.innerWidth - 24) / PB.W);
   _pfCanvas.style.width  = (PB.W * scale) + 'px';
   _pfCanvas.style.height = (PB.H * scale) + 'px';

@@ -1,0 +1,65 @@
+{
+  "schema": "pinball-buddy/tables/1",
+  "tables": [
+    {
+      "id": "worm_holer",
+      "name": "WORM HOLER",
+      "subtitle": "Quantum Pinball",
+      "status": "playable",
+      "theme": "Black holes, deep space, quantum entanglement",
+      "colors": {
+        "bg": "#0a0a1f",
+        "mid": "#1a1145",
+        "neon": "#ff3ea5",
+        "neon2": "#39d7ff",
+        "wall": "#5b4b9e"
+      },
+      "catchphrases": [
+        "WORMHOLE JUMP",
+        "QUANTUM ENTANGLEMENT",
+        "EVENT HORIZON",
+        "SINGULARITY BONUS"
+      ]
+    },
+    {
+      "id": "barfs_house",
+      "name": "BARF'S HOUSE",
+      "subtitle": "Intergalactic Diner",
+      "status": "placeholder",
+      "theme": "Fake 80s sitcom, Muppet-alien chicken restaurant",
+      "colors": {
+        "bg": "#1a0f05",
+        "mid": "#3a2410",
+        "neon": "#ff8a1e",
+        "neon2": "#6dd44a",
+        "wall": "#7a5230"
+      },
+      "catchphrases": [
+        "SQUAWK IF YOU'RE HUNGRY!",
+        "TABLE FOR TWO THOUSAND?",
+        "THE GRILL IS ON FIRE!",
+        "BARF SAYS THANK YOU!"
+      ]
+    },
+    {
+      "id": "shower_defense",
+      "name": "SHOWER DEFENSE",
+      "subtitle": "Tower Defense Parody",
+      "status": "placeholder",
+      "theme": "Tower defense parody, defend your shower, bathroom puns",
+      "colors": {
+        "bg": "#04141a",
+        "mid": "#0a2e3a",
+        "neon": "#28e0e0",
+        "neon2": "#4aa6ff",
+        "wall": "#2f6f7a"
+      },
+      "catchphrases": [
+        "SCRUB HARDER!",
+        "DRAIN DEFENDER!",
+        "SQUEAKY CLEAN!",
+        "THE GRIME IS SPREADING!"
+      ]
+    }
+  ]
+}
