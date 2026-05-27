@@ -2,6 +2,8 @@
  * PINBALL BUDDY — Pinball.js
  * v0.004    — full physics rebuild
  * v0.004.1  — lane-feed arc, top-right hood redesign, flipper-gap drain fix
+ * v0.005    — swept flipper collision, DMD animations+attract reel, initials
+ *             entry, high-score table, credit/match/free-game, teleport holes
  *
  * Single-file ES module. Exports openPinball().
  *
@@ -83,7 +85,7 @@ const PB = {
 // playfield bounding walls (used by every table)
 const WALL = { L: 26, R: 514, T: 26, DRAIN_Y: 944 };
 
-export const PB_VERSION = 'v0.004.1';
+export const PB_VERSION = 'v0.005';
 
 /* ==========================================================================
  * SECTION 3 — COLLIDER PRIMITIVES
@@ -260,13 +262,21 @@ function freshPB() {
     plungeCharge: 0,       // 0..1
     plungePower: 0,        // captured on release
     flipper: { lU: 0, lA: 0, rU: 0, rA: 0 }, // current/target angles per flipper group
-    dmd: { mode: 'attract', msg: '', sub: '', timer: 0, t: 0 },
+    dmd: { mode: 'attract', msg: '', sub: '', timer: 0, t: 0,
+           queue: [], animT: 0 },
+    initials: { active: false, slot: 0, idx: 0, letters: [' ', ' ', ' '] },
+    credits: 0,
     modeName: '',
     modeTimer: 0,
     tick: 0,
     shake: 0,
     started: false,
     highScore: 0,
+    // end-of-game flow
+    endStage: null,        // gameover | initials | highscore | match | freegame | done
+    endQualifies: false,
+    matchWon: false,
+    pendingFreeGame: null,
   };
 }
 
@@ -284,6 +294,7 @@ function Ball(x, y) {
     feedT: 0,             // progress along the feed arc (0..1)
     feedSpeed: 9,         // speed carried through the feed arc
     stuckTimer: 0,        // anti-stuck watchdog
+    flipHitFrame: -1,     // last frame this ball took a flipper power-punch
     lastSpeed: 0,
     trail: [],
   };
@@ -341,6 +352,24 @@ function snd(name) {
     case 'mode':     [330,440,550].forEach((f,i)=>setTimeout(()=>tone(f,0.25,'triangle',0.16),i*100)); break;
     case 'lock':     tone(294, 0.2, 'sine', 0.14, 180); break;
     case 'gameover': [440,392,349,294,247].forEach((f,i)=>setTimeout(()=>tone(f,0.4,'sawtooth',0.16),i*220)); break;
+    // ---- animation / DMD cues -------------------------------------------
+    case 'gameStart': [523,659,784,1046,1318].forEach((f,i)=>setTimeout(()=>tone(f,0.18,'square',0.15),i*80)); break;
+    case 'whoosh':   noise(0.35, 0.13, 900); break;
+    case 'clunk':    tone(110, 0.12, 'square', 0.16); break;
+    case 'warp':     tone(1200, 0.3, 'sine', 0.14, 180); noise(0.3, 0.08, 1400); break;
+    case 'teleport': [660,880,1100].forEach((f,i)=>setTimeout(()=>tone(f,0.16,'sine',0.13,f*1.4),i*70)); break;
+    case 'blackhole':tone(70, 0.7, 'sawtooth', 0.18, 30); noise(0.7, 0.12, 200); break;
+    case 'highscore':[523,659,784,1046,784,1046,1318].forEach((f,i)=>setTimeout(()=>tone(f,0.2,'square',0.16),i*110)); break;
+    // the classic pinball "knocker" pop — used for free game / match win
+    case 'pop':      tone(90, 0.09, 'square', 0.22); noise(0.06, 0.18, 400); break;
+    case 'buzz':     tone(120, 0.35, 'sawtooth', 0.16, 80); break;
+    case 'freegame': [784,1046,1318].forEach((f,i)=>setTimeout(()=>{tone(f,0.15,'square',0.16);},i*90));
+                     setTimeout(()=>snd('pop'), 300); break;
+    case 'matchroll':[ ]; { let i=0; const r=()=>{ if(i<14){ tone(300+((i*7)%9)*40,0.05,'square',0.10); i++; setTimeout(r,70);} }; r(); } break;
+    case 'attractStart': tone(330, 0.25, 'triangle', 0.10, 660); break;
+    case 'cursor':   tone(520, 0.04, 'square', 0.08); break;
+    case 'confirm':  tone(784, 0.12, 'square', 0.14, 1046); break;
+    case 'holeOpen': tone(440, 0.14, 'sine', 0.11, 760); break;
     default: break;
   }
 }
@@ -437,6 +466,408 @@ function dmdTextCentered(grid, str, y, on = 1) {
 }
 
 /* ==========================================================================
+ * SECTION 7b — DMD ANIMATION ENGINE
+ * --------------------------------------------------------------------------
+ * A small frame-based cutscene system layered on top of the dot grid. An
+ * "animation" is { dur, render(grid, p, t), sound? } where p is 0..1 progress
+ * and t is the raw frame count. Animations are pushed to a queue; drawDMD
+ * plays the head of the queue. Event animations are SHORT (~3s); the attract
+ * sequence is a long looping reel. None of this touches physics.
+ *
+ * Helper draw primitives all work on the virtual dot grid (108 x 26).
+ * ========================================================================== */
+
+// ---- low-level dot primitives ------------------------------------------
+function dmdDot(grid, x, y, on = 1) {
+  x = x | 0; y = y | 0;
+  if (x >= 0 && x < DMD.cols && y >= 0 && y < DMD.rows) grid[y][x] = on;
+}
+function dmdRect(grid, x, y, w, h, on = 1) {
+  for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) dmdDot(grid, x + c, y + r, on);
+}
+function dmdBox(grid, x, y, w, h, on = 1) {
+  for (let c = 0; c < w; c++) { dmdDot(grid, x + c, y, on); dmdDot(grid, x + c, y + h - 1, on); }
+  for (let r = 0; r < h; r++) { dmdDot(grid, x, y + r, on); dmdDot(grid, x + w - 1, y + r, on); }
+}
+function dmdCircle(grid, cx, cy, rad, on = 1, fill = false) {
+  const r2 = rad * rad;
+  for (let y = -rad; y <= rad; y++) {
+    for (let x = -rad; x <= rad; x++) {
+      const d = x * x + y * y;
+      if (fill ? d <= r2 : (d <= r2 && d > (rad - 1.4) * (rad - 1.4)))
+        dmdDot(grid, cx + x, cy + y, on);
+    }
+  }
+}
+function dmdLine(grid, x0, y0, x1, y1, on = 1) {
+  x0 |= 0; y0 |= 0; x1 |= 0; y1 |= 0;
+  const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  for (;;) {
+    dmdDot(grid, x0, y0, on);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x0 += sx; }
+    if (e2 < dx) { err += dx; y0 += sy; }
+  }
+}
+// width of a string in dots
+function dmdTextWidth(str) { return String(str).length * 6 - 1; }
+
+// ---- animation queue ----------------------------------------------------
+function dmdPlay(anim) {
+  // anim: { dur, render, sound, loop?, name? }
+  if (!_pb.dmd.queue) _pb.dmd.queue = [];
+  _pb.dmd.queue.push(anim);
+  if (_pb.dmd.queue.length === 1) { _pb.dmd.animT = 0; if (anim.sound) snd(anim.sound); }
+}
+function dmdPlayExclusive(anim) {
+  // clear queue and play immediately (used for big interrupts)
+  _pb.dmd.queue = [anim];
+  _pb.dmd.animT = 0;
+  if (anim.sound) snd(anim.sound);
+}
+function dmdClearQueue() { _pb.dmd.queue = []; _pb.dmd.animT = 0; }
+function dmdBusy() { return _pb.dmd.queue && _pb.dmd.queue.length > 0; }
+
+// advance the animation queue one frame; returns the grid to draw, or null
+function dmdStepAnim() {
+  const q = _pb.dmd.queue;
+  if (!q || q.length === 0) return null;
+  const anim = q[0];
+  const grid = newGrid();
+  const p = anim.dur > 0 ? Math.min(1, _pb.dmd.animT / anim.dur) : 1;
+  anim.render(grid, p, _pb.dmd.animT);
+  _pb.dmd.animT++;
+  // fire mid-animation sound cues
+  if (anim.cues) {
+    for (const cue of anim.cues) {
+      if (cue.at === _pb.dmd.animT) snd(cue.snd);
+    }
+  }
+  if (_pb.dmd.animT > anim.dur) {
+    if (anim.loop) { _pb.dmd.animT = 0; }
+    else {
+      q.shift();
+      _pb.dmd.animT = 0;
+      if (q.length && q[0].sound) snd(q[0].sound);
+    }
+  }
+  return grid;
+}
+
+/* ==========================================================================
+ * SECTION 7c — DMD ANIMATION LIBRARY
+ * --------------------------------------------------------------------------
+ * All cutscenes and the attract reel, drawn in the dot-matrix style. Event
+ * animations run ~3s (180 frames); the attract reel is a ~30s loop.
+ * Every animation that should be heard names a `sound` (played on start)
+ * and/or `cues` (sounds at specific frames).
+ * ========================================================================== */
+
+// shared little dot-art helpers ------------------------------------------
+// a swirling black-hole motif used in several Worm Holer animations
+function dmdBlackHole(grid, cx, cy, t, scale = 1) {
+  const arms = 3;
+  for (let a = 0; a < arms; a++) {
+    for (let r = 1; r < 11 * scale; r++) {
+      const ang = a * (TAU / arms) + t * 0.13 + r * 0.42;
+      const x = cx + Math.cos(ang) * r;
+      const y = cy + Math.sin(ang) * r * 0.62;
+      dmdDot(grid, x, y, 1);
+    }
+  }
+  dmdCircle(grid, cx, cy, Math.max(1, 2 * scale), 1, true);
+}
+// a small pinball with a highlight
+function dmdBall(grid, cx, cy, rad = 3) {
+  dmdCircle(grid, cx, cy, rad, 1, true);
+  dmdDot(grid, cx - 1, cy - 1, 0);
+}
+// starfield twinkle
+function dmdStars(grid, t, seed = 1) {
+  for (let i = 0; i < 24; i++) {
+    const x = ((i * 47 + seed * 13) % DMD.cols);
+    const y = ((i * 29 + seed * 7) % DMD.rows);
+    if (((t >> 3) + i) % 5 !== 0) dmdDot(grid, x, y, 1);
+  }
+}
+
+// ---- EVENT ANIMATIONS (each ~180 frames / 3s) --------------------------
+function animGameStart(table) {
+  return {
+    dur: 150, sound: 'gameStart',
+    cues: [{ at: 70, snd: 'whoosh' }],
+    render(grid, p, t) {
+      dmdStars(grid, t, 3);
+      // title rushes in from the sides and settles
+      const name = table.name.toUpperCase().substring(0, 16);
+      const w = dmdTextWidth(name);
+      const tx = Math.floor((DMD.cols - w) / 2);
+      const slide = Math.round((1 - Math.min(1, p * 1.8)) * 60);
+      dmdText(grid, name, tx - slide, 6, 1);
+      if (p > 0.5) {
+        const sub = 'BALL 1 - GO';
+        dmdTextCentered(grid, sub, 16, (t >> 3) & 1);
+      }
+    },
+  };
+}
+function animGameOver(table, score, isHigh) {
+  return {
+    dur: 200, sound: 'gameover',
+    render(grid, p, t) {
+      // collapsing black hole swallows the field
+      const cx = DMD.cols / 2, cy = DMD.rows / 2;
+      const sc = Math.max(0.2, 1 - p);
+      dmdBlackHole(grid, cx, cy, t, sc);
+      if (p > 0.35) dmdTextCentered(grid, 'GAME OVER', 4, 1);
+      if (p > 0.6) dmdTextCentered(grid, shortNum(score), 17, 1);
+      if (p > 0.6 && isHigh) dmdTextCentered(grid, 'GREAT SCORE', 17, ((t >> 3) & 1));
+    },
+  };
+}
+function animBallLock() {
+  return {
+    dur: 165, sound: 'lock',
+    cues: [{ at: 60, snd: 'clunk' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2;
+      // a ball falls into a hole and the hole shuts
+      const by = Math.min(13, 2 + p * 26);
+      if (p < 0.55) dmdBall(grid, cx, by, 3);
+      // the hole iris
+      const iris = p < 0.55 ? 6 : Math.round(6 * (1 - (p - 0.55) / 0.45));
+      dmdCircle(grid, cx, 14, Math.max(1, iris), 1, false);
+      dmdTextCentered(grid, 'BALL LOCKED', 19, p > 0.4 ? 1 : 0);
+    },
+  };
+}
+function animMultiball() {
+  return {
+    dur: 200, sound: 'multiball',
+    cues: [{ at: 40, snd: 'whoosh' }, { at: 110, snd: 'pop' }],
+    render(grid, p, t) {
+      dmdStars(grid, t, 5);
+      const cx = DMD.cols / 2, cy = 9;
+      dmdBlackHole(grid, cx, cy, t, 1);
+      // balls scatter outward from the hole
+      const n = 5;
+      for (let i = 0; i < n; i++) {
+        const ang = i * (TAU / n) + t * 0.05;
+        const rr = p * 40;
+        dmdBall(grid, cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr * 0.6, 2);
+      }
+      dmdTextCentered(grid, 'MULTIBALL', 19, (t >> 2) & 1);
+    },
+  };
+}
+function animBlackHole() {
+  return {
+    dur: 180, sound: 'blackhole',
+    cues: [{ at: 90, snd: 'whoosh' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2, cy = 11;
+      dmdBlackHole(grid, cx, cy, t * 2, 1 + p * 0.5);
+      // ring shockwave
+      const rr = Math.round(p * 24);
+      if (rr > 2) dmdCircle(grid, cx, cy, rr, ((t >> 1) & 1), false);
+      dmdTextCentered(grid, 'EVENT HORIZON', 21, (t >> 3) & 1);
+    },
+  };
+}
+function animTeleporter() {
+  return {
+    dur: 150, sound: 'teleport',
+    cues: [{ at: 70, snd: 'warp' }],
+    render(grid, p, t) {
+      // two portals; a ball jumps between them
+      const lx = 26, rx = DMD.cols - 26, cy = 12;
+      for (const px of [lx, rx]) {
+        const ir = 4 + Math.round(Math.sin(t * 0.3 + px) * 1.5);
+        dmdCircle(grid, px, cy, ir, 1, false);
+      }
+      const bx = lx + (rx - lx) * p;
+      const by = cy - Math.sin(p * Math.PI) * 7;
+      if (p > 0.08 && p < 0.92) dmdBall(grid, bx, by, 2);
+      dmdTextCentered(grid, 'WORMHOLE JUMP', 20, (t >> 3) & 1);
+    },
+  };
+}
+function animHighScore(score) {
+  return {
+    dur: 200, sound: 'highscore',
+    cues: [{ at: 30, snd: 'pop' }, { at: 90, snd: 'pop' }, { at: 150, snd: 'pop' }],
+    render(grid, p, t) {
+      dmdStars(grid, t, 9);
+      // fireworks
+      for (let f = 0; f < 3; f++) {
+        const fcx = 22 + f * 32, fcy = 9;
+        const burst = ((t - f * 30) % 90);
+        if (burst >= 0 && burst < 24) {
+          const rr = burst * 0.5;
+          for (let i = 0; i < 8; i++) {
+            const ang = i * (TAU / 8);
+            dmdDot(grid, fcx + Math.cos(ang) * rr, fcy + Math.sin(ang) * rr * 0.7, 1);
+          }
+        }
+      }
+      dmdTextCentered(grid, 'HIGH SCORE', 16, 1);
+      dmdTextCentered(grid, shortNum(score), 21, (t >> 3) & 1);
+    },
+  };
+}
+function animFreeGame(reason) {
+  // reason: 'MATCH' or 'HIGH SCORE' or 'SPECIAL'
+  return {
+    dur: 170, sound: 'freegame',
+    cues: [{ at: 20, snd: 'pop' }, { at: 80, snd: 'pop' }],
+    render(grid, p, t) {
+      dmdBox(grid, 8, 3, DMD.cols - 16, DMD.rows - 6, (t >> 2) & 1);
+      dmdTextCentered(grid, 'FREE GAME', 8, 1);
+      dmdTextCentered(grid, reason, 16, (t >> 3) & 1);
+    },
+  };
+}
+// the end-of-game MATCH sequence: digits spin then settle
+function animMatch(playerDigit, matchDigit, won) {
+  return {
+    dur: 230, sound: 'matchroll',
+    cues: won ? [{ at: 150, snd: 'pop' }] : [{ at: 150, snd: 'buzz' }],
+    render(grid, p, t) {
+      dmdTextCentered(grid, 'MATCH', 3, 1);
+      // two big-ish digits; spin until ~frame 150 then lock
+      const locked = t > 150;
+      const dShow = locked ? matchDigit : (t % 10);
+      const pShow = playerDigit;
+      // draw player digit (left) and match digit (right) using glyph scale x2
+      dmdDigitBig(grid, 34, 11, pShow);
+      dmdDigitBig(grid, 60, 11, dShow);
+      if (locked) {
+        dmdTextCentered(grid, won ? 'MATCH - FREE GAME' : 'NO MATCH', 22, (t >> 3) & 1);
+      }
+    },
+  };
+}
+// draw a digit at 2x scale
+function dmdDigitBig(grid, x, y, d) {
+  const g = GLYPHS[String(d)] || GLYPHS['0'];
+  for (let r = 0; r < 7; r++)
+    for (let c = 0; c < 5; c++)
+      if (g[r][c] === '1') dmdRect(grid, x + c * 2, y + r * 2, 2, 2, 1);
+}
+
+// ---- INITIALS ENTRY -----------------------------------------------------
+const INITIALS_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.<';  // < = back/end
+function animInitialsEntry() {
+  // not time-bounded — render reads live _pb.initials state
+  return {
+    dur: 999999, loop: true, sound: 'highscore',
+    render(grid, p, t) {
+      const st = _pb.initials;
+      dmdTextCentered(grid, 'HIGH SCORE', 2, 1);
+      dmdTextCentered(grid, 'ENTER INITIALS', 9, 1);
+      // three slots
+      const slotW = 8, gap = 4, total = 3 * slotW + 2 * gap;
+      const sx = Math.floor((DMD.cols - total) / 2);
+      for (let i = 0; i < 3; i++) {
+        const cx = sx + i * (slotW + gap);
+        const ch = _pb.initials.letters[i] || ' ';
+        dmdText(grid, ch, cx + 1, 16, 1);
+        if (i === st.slot) {
+          // blinking underline cursor on the active slot
+          if ((t >> 3) & 1) for (let c = 0; c < 6; c++) dmdDot(grid, cx + c, 24, 1);
+        } else {
+          for (let c = 0; c < 6; c++) dmdDot(grid, cx + c, 24, 1);
+        }
+      }
+    },
+  };
+}
+
+// ---- ATTRACT REEL (~30s loop) ------------------------------------------
+/* The attract reel is one long looping animation made of timed segments:
+ *   0.0 -  6s  title build with black-hole motif
+ *   6s - 10s  tagline / "a quantum pinball adventure"
+ *  10s - 22s  high-score table (scrolls through entries)
+ *  22s - 27s  "how to play" flash
+ *  27s - 30s  big "PRESS LAUNCH" call to action, then loop
+ */
+function animAttractReel(table) {
+  const FPS = 60;
+  const SEGS = [
+    { len: 6 * FPS, draw: attractTitle },
+    { len: 4 * FPS, draw: attractTagline },
+    { len: 12 * FPS, draw: attractScores },
+    { len: 5 * FPS, draw: attractHowTo },
+    { len: 3 * FPS, draw: attractPressLaunch },
+  ];
+  const total = SEGS.reduce((s, x) => s + x.len, 0);
+  return {
+    dur: total, loop: true, sound: 'attractStart',
+    cues: [{ at: 1, snd: 'attractStart' }],
+    render(grid, p, t) {
+      let acc = 0;
+      for (const seg of SEGS) {
+        if (t < acc + seg.len) {
+          seg.draw(grid, (t - acc) / seg.len, t, table);
+          return;
+        }
+        acc += seg.len;
+      }
+      attractPressLaunch(grid, 0.5, t, table);
+    },
+  };
+}
+function attractTitle(grid, p, t, table) {
+  dmdStars(grid, t, 2);
+  dmdBlackHole(grid, DMD.cols / 2, 11, t * 1.5, 1);
+  const name = table.name.toUpperCase().substring(0, 16);
+  // letters drop in one at a time
+  const w = dmdTextWidth(name);
+  const sx = Math.floor((DMD.cols - w) / 2);
+  const shown = Math.min(name.length, Math.floor(p * name.length * 1.6));
+  for (let i = 0; i < shown; i++) {
+    dmdText(grid, name[i], sx + i * 6, 17, 1);
+  }
+}
+function attractTagline(grid, p, t, table) {
+  dmdStars(grid, t, 4);
+  const sub = (table.subtitle || 'QUANTUM PINBALL').toUpperCase();
+  // typewriter reveal
+  const shown = Math.min(sub.length, Math.floor(p * sub.length * 1.5));
+  dmdTextCentered(grid, sub.substring(0, shown), 8, 1);
+  if (p > 0.6) dmdTextCentered(grid, 'BEND SPACE - WIN BIG', 16, (t >> 3) & 1);
+}
+function attractScores(grid, p, t, table) {
+  dmdTextCentered(grid, 'BEST PHYSICISTS', 2, 1);
+  const tbl = loadHighTable(table.id);
+  // show 5 rows, slow vertical scroll through them
+  const rowH = 8;
+  const startY = 11 - Math.floor((p * tbl.length * rowH)) % (tbl.length * rowH);
+  for (let i = 0; i < tbl.length; i++) {
+    const y = startY + i * rowH;
+    if (y < 4 || y > DMD.rows - 2) continue;
+    const e = tbl[i];
+    dmdText(grid, (i + 1) + '.' + e.name, 6, y, 1);
+    const sc = shortNum(e.score);
+    dmdText(grid, sc, DMD.cols - dmdTextWidth(sc) - 6, y, 1);
+  }
+}
+function attractHowTo(grid, p, t) {
+  dmdTextCentered(grid, 'FLIPPERS - L / R', 4, 1);
+  dmdTextCentered(grid, 'HOLD LAUNCH', 12, 1);
+  dmdTextCentered(grid, 'TO CHARGE PLUNGER', 19, (t >> 3) & 1);
+}
+function attractPressLaunch(grid, p, t, table) {
+  dmdStars(grid, t, 6);
+  dmdTextCentered(grid, (table ? table.name.toUpperCase() : 'PINBALL').substring(0, 16), 4, 1);
+  dmdBox(grid, 22, 12, DMD.cols - 44, 11, 1);
+  dmdTextCentered(grid, 'PRESS LAUNCH', 15, (t >> 3) & 1);
+}
+
+/* ==========================================================================
  * (engine continues in part 2 — geometry builders, table, physics step,
  *  render, UI — appended below)
  * ========================================================================== */
@@ -464,6 +895,7 @@ function makeFlipper(opt) {
     rest: opt.rest,                 // absolute rest angle (radians)
     active: opt.active,             // absolute active angle (radians)
     angle: opt.rest,                // current angle
+    prevAngle: opt.rest,            // angle at start of frame (for swept collision)
     av: 0,                          // angular velocity (rad/frame)
     up: false,                      // commanded up?
     speed: opt.speed ?? 0.62,       // how fast it swings (rad/frame)
@@ -474,12 +906,33 @@ function flipperTip(fl) {
            y: fl.py + Math.sin(fl.angle) * fl.len };
 }
 function flipperCollider(fl) {
+  // single segment at the CURRENT angle (used for rendering / simple queries)
   const tip = flipperTip(fl);
   return seg(fl.px, fl.py, tip.x, tip.y, { r: fl.r, role: 'flipper', bounce: 0.5, ref: fl });
+}
+/* Swept flipper colliders: a flipper can sweep several ball-widths in one
+ * frame, so a single frozen segment lets a fast-swinging flipper pass right
+ * through the ball (tunneling, worst at the tip). Instead we emit a fan of
+ * interpolated segments spanning prevAngle..angle, so the ball's swept test
+ * meets the flipper wherever the arc crosses it. All share the same `ref`,
+ * so momentum transfer in respondCollision is unchanged. */
+function flipperSweptColliders(fl, out) {
+  const a0 = fl.prevAngle, a1 = fl.angle;
+  const arc = Math.abs(a1 - a0);
+  // tip travel in pixels = arc * len ; one sub-segment per ~half ball radius
+  const steps = Math.max(1, Math.min(10, Math.ceil((arc * fl.len) / (PB.BALL_R * 0.5))));
+  for (let i = 0; i <= steps; i++) {
+    const a = a0 + (a1 - a0) * (i / steps);
+    const tx = fl.px + Math.cos(a) * fl.len;
+    const ty = fl.py + Math.sin(a) * fl.len;
+    out.push(seg(fl.px, fl.py, tx, ty,
+      { r: fl.r, role: 'flipper', bounce: 0.5, ref: fl }));
+  }
 }
 function updateFlipper(fl) {
   const target = fl.up ? fl.active : fl.rest;
   const prev = fl.angle;
+  fl.prevAngle = prev;             // remember where the flipper was this frame
   // move toward target, capped by swing speed
   const diff = target - fl.angle;
   const step = clamp(diff, -fl.speed, fl.speed);
@@ -577,6 +1030,7 @@ function buildWormHoler(tdef) {
     lanes: [],          // rollover lanes (top)
     spinners: [],
     lockZone: null,
+    teleHoles: null,      // timed open/close teleport holes
     // logic state
     wormProgress: 0,    // letters of WORM hit
     holeProgress: 0,    // letters of HOLE hit
@@ -742,6 +1196,32 @@ function buildWormHoler(tdef) {
   /* ---- ball lock (center sink, triggers multiball) ---- */
   T.lockZone = { x: 260, y: 220, r: 20, active: true };
 
+  /* ---- timed teleport holes (mechanical, always visible) ---- */
+  // Four holes that open and close on a progression-linked schedule. When
+  // open, a ball entering the hole is captured briefly, then ejected from
+  // a random OTHER open hole — including the "unreachable pocket" (hole 3)
+  // which is behind a wall section only a teleport can reach.
+  T.teleHoles = [
+    { id: 0, x: 80,  y: 180, r: 16, label: 'A', open: false, timer: 0,
+      capturedBall: null, captureTimer: 0, holdFrames: 50, iris: 0 },
+    { id: 1, x: 460, y: 480, r: 16, label: 'B', open: false, timer: 0,
+      capturedBall: null, captureTimer: 0, holdFrames: 50, iris: 0 },
+    { id: 2, x: 270, y: 650, r: 16, label: 'C', open: false, timer: 0,
+      capturedBall: null, captureTimer: 0, holdFrames: 50, iris: 0 },
+    // hole D is in a walled-off pocket — unreachable except by teleport
+    { id: 3, x: 420, y: 130, r: 16, label: 'D', open: false, timer: 0,
+      capturedBall: null, captureTimer: 0, holdFrames: 50, iris: 0, secret: true },
+  ];
+  // small wall enclosing the "secret" pocket so the ball can only arrive via teleport
+  T.staticColliders.push(
+    seg(400, 115, 440, 115, { r:3, role:'wall', color:T.colors.wall }),  // top
+    seg(400, 115, 400, 148, { r:3, role:'wall', color:T.colors.wall }),  // left
+    seg(440, 115, 440, 148, { r:3, role:'wall', color:T.colors.wall }),  // right
+    // bottom has a small gap so the ball eventually rolls out after eject
+    seg(400, 148, 413, 148, { r:3, role:'wall', color:T.colors.wall }),
+    seg(427, 148, 440, 148, { r:3, role:'wall', color:T.colors.wall }),
+  );
+
   /* ---- top rollover lanes (skill-shot style) ---- */
   T.lanes.push(
     { x: 175, y: 86, lit: false }, { x: 270, y: 78, lit: false }, { x: 365, y: 86, lit: false },
@@ -816,8 +1296,9 @@ function assembleColliders(T) {
   for (const p of T.posts) list.push(p);
   // lane gate (one-way, toggled active when a ball is leaving the lane)
   if (T.laneGate) list.push(T.laneGate);
-  // flippers (rebuilt from current angle)
-  for (const fl of T.flippers) list.push(flipperCollider(fl));
+  // flippers — emit a swept fan of segments across this frame's arc so a
+  // fast swing cannot tunnel through the ball
+  for (const fl of T.flippers) flipperSweptColliders(fl, list);
   // bumpers
   for (const b of T.bumpers) list.push(bumperCollider(b));
   // targets — ALWAYS solid
@@ -914,6 +1395,7 @@ function rideRamp(ball) {
  * ========================================================================== */
 function stepBall(ball, T, colliders) {
   if (ball.dead) return;
+  if (ball._captured) return;   // held inside a teleport hole
 
   /* --- on a ramp: dedicated integrator --- */
   if (ball.onRamp) {
@@ -1004,6 +1486,23 @@ function stepBall(ball, T, colliders) {
       // kill inward velocity component so it doesn't re-penetrate
       const vn = ball.vx * push.nx + ball.vy * push.ny;
       if (vn < 0) { ball.vx -= vn * push.nx; ball.vy -= vn * push.ny; }
+      // a rising flipper that has swept INTO a resting ball should still
+      // flick it — the swept-segment test can miss a near-stationary ball,
+      // so impart the flipper's surface velocity + punch here as a fallback.
+      if (col.role === 'flipper') {
+        const fl = col.ref;
+        if (fl.up && Math.abs(fl.av) > 0.05 && ball.flipHitFrame !== _pb.tick) {
+          ball.flipHitFrame = _pb.tick;
+          const armX = ball.x - fl.px, armY = ball.y - fl.py;
+          ball.vx += -armY * fl.av * 1.15;
+          ball.vy +=  armX * fl.av * 1.15;
+          const armLen = clamp(Math.hypot(armX, armY) / fl.len, 0, 1);
+          const punch = 4 + armLen * 5;
+          ball.vx += push.nx * punch;
+          ball.vy += push.ny * punch;
+          snd('flipper');
+        }
+      }
     }
   }
 
@@ -1059,6 +1558,26 @@ function stepBall(ball, T, colliders) {
   }
 
   pushTrail(ball);
+
+  /* --- hard containment backstop ---------------------------------------
+   * Swept collision plus depenetration handles essentially every case, but
+   * an extreme-speed ball striking a corner at a glancing angle can, very
+   * rarely, slip outside the cabinet. This is a guaranteed net: if the ball
+   * is ever outside the side/top boundary it is snapped back in and its
+   * outward velocity is reflected. It can never fail because it is a pure
+   * clamp, not a collision test. (The bottom is intentionally open: that is
+   * the drain.) */
+  if (ball.x < WALL.L + ball.r) {
+    ball.x = WALL.L + ball.r;
+    if (ball.vx < 0) ball.vx = -ball.vx * 0.4;
+  } else if (ball.x > WALL.R - ball.r) {
+    ball.x = WALL.R - ball.r;
+    if (ball.vx > 0) ball.vx = -ball.vx * 0.4;
+  }
+  if (ball.y < WALL.T + ball.r) {
+    ball.y = WALL.T + ball.r;
+    if (ball.vy < 0) ball.vy = -ball.vy * 0.4;
+  }
 
   /* --- drain --- */
   if (ball.y > WALL.DRAIN_Y) {
@@ -1221,8 +1740,11 @@ function respondCollision(ball, hit, T) {
       ball.vx += surfVx * transfer;
       ball.vy += surfVy * transfer;
       // when flipper is actively swinging up and ball is near tip, give the
-      // signature "live catch -> flick" punch
-      if (fl.up && Math.abs(fl.av) > 0.05) {
+      // signature "live catch -> flick" punch. The swept flipper now emits a
+      // FAN of sub-segments, so guard the punch to once per ball per frame to
+      // avoid stacking it and over-launching.
+      if (fl.up && Math.abs(fl.av) > 0.05 && ball.flipHitFrame !== _pb.tick) {
+        ball.flipHitFrame = _pb.tick;
         const armLen = Math.hypot(armX, armY) / fl.len; // 0..1 along flipper
         const punch = 4 + armLen * 5;
         ball.vx += nx * punch;
@@ -1286,12 +1808,12 @@ function onTargetHit(t, T) {
     if (t.group === 'worm') {
       T.wormProgress++;
       activateWormHole(T);
-      dmdFlash('WORM COMPLETE', 'HOLE ' + Math.min(T.activeHoles, 4) + ' OPEN');
+      dmdPlay(animBlackHole());
       addScore(3000 * _pb.mult);
     } else if (t.group === 'hole') {
       T.holeProgress++;
       activateWormHole(T);
-      dmdFlash('HOLE COMPLETE', 'WORMHOLE CHARGED');
+      dmdPlay(animBlackHole());
       addScore(3000 * _pb.mult);
     }
     snd('group');
@@ -1334,7 +1856,7 @@ function onWormHoleEnter(ball, wh, T) {
   const s = rand(7, 10);
   ball.vx = Math.cos(a) * s;
   ball.vy = Math.abs(Math.sin(a) * s);
-  dmdFlash('WORMHOLE JUMP', '+' + (1500 * _pb.mult));
+  dmdPlay(animTeleporter());
   bumpCombo();
 }
 
@@ -1344,8 +1866,7 @@ function onBallLock(ball, T) {
     // START MULTIBALL
     T.lockZone.active = false;
     T.multiballArmed = false;
-    snd('multiball');
-    dmdFlash('MULTIBALL', 'QUANTUM ENTANGLEMENT');
+    dmdPlay(animMultiball());
     _pb.mult = Math.max(_pb.mult, 2);
     // ball that entered is re-ejected, plus 2 more spawn
     ejectFromLock(ball, T);
@@ -1359,7 +1880,7 @@ function onBallLock(ball, T) {
   } else {
     // not armed: lock just scores + kicks ball out
     addScore(2000 * _pb.mult);
-    snd('lock');
+    dmdPlay(animBallLock());
     ejectFromLock(ball, T);
   }
 }
@@ -1372,17 +1893,156 @@ function ejectFromLock(ball, T) {
   ball.onRamp = null; ball.inLane = false; ball.dead = false;
 }
 
+/* ==========================================================================
+ * SECTION 16b — TIMED TELEPORT HOLES
+ * --------------------------------------------------------------------------
+ * Four mechanical holes are always visible on the playfield. They open and
+ * close on a schedule that's partly random and partly tied to progression
+ * (higher score / more wormholes active → more frequent cycling). When open,
+ * a ball entering the hole is captured, held for ~1s, and ejected from a
+ * random OTHER hole — including the "secret" pocket that is otherwise walled
+ * off, giving the ball access to an area it can't reach by normal play.
+ *
+ * Progression stages (determined by score + wormhole count):
+ *   stage 0 (start):      1 hole eligible at a time, cycles every 5-7s
+ *   stage 1 (score > 15k): 2 holes eligible, cycles every 4-6s
+ *   stage 2 (score > 50k): 3 holes eligible, cycles every 3-5s
+ *   stage 3 (score > 100k):all 4 eligible, rapid 2-4s cycling
+ * ========================================================================== */
+function teleHoleStage() {
+  const s = _pb.score;
+  const wh = _table ? (_table.activeHoles || 0) : 0;
+  if (s > 100000 || wh >= 4) return 3;
+  if (s > 50000 || wh >= 3) return 2;
+  if (s > 15000 || wh >= 2) return 1;
+  return 0;
+}
+const TELE_STAGE_CFG = [
+  { eligible: 1, minCycle: 300, maxCycle: 420 },   // 5-7s
+  { eligible: 2, minCycle: 240, maxCycle: 360 },   // 4-6s
+  { eligible: 3, minCycle: 180, maxCycle: 300 },   // 3-5s
+  { eligible: 4, minCycle: 120, maxCycle: 240 },   // 2-4s
+];
+
+function resetTeleHoles(T) {
+  if (!T.teleHoles) return;
+  for (const h of T.teleHoles) {
+    h.open = false; h.timer = 0; h.capturedBall = null;
+    h.captureTimer = 0; h.iris = 0;
+  }
+  // seed the first open cycle
+  const cfg = TELE_STAGE_CFG[0];
+  T.teleHoles[0].timer = Math.floor(rand(60, 120));  // first hole opens quickly
+}
+
+function stepTeleHoles(T) {
+  const stage = teleHoleStage();
+  const cfg = TELE_STAGE_CFG[stage];
+
+  for (const h of T.teleHoles) {
+    // animate iris (visual smoothing)
+    h.iris += (h.open ? 1 : -1) * 0.08;
+    h.iris = clamp(h.iris, 0, 1);
+
+    // handle captured ball
+    if (h.capturedBall) {
+      h.captureTimer--;
+      if (h.captureTimer <= 0) {
+        ejectFromTeleHole(h, T);
+      }
+      continue;
+    }
+
+    // cycle timer
+    h.timer--;
+    if (h.timer <= 0) {
+      h.open = !h.open;
+      if (h.open) {
+        snd('holeOpen');
+        h.timer = Math.floor(rand(90, 180)); // stay open 1.5-3s
+      } else {
+        // pick next open time
+        h.timer = Math.floor(rand(cfg.minCycle, cfg.maxCycle));
+      }
+    }
+
+    // capture check — only for open holes with no captured ball
+    if (h.open) {
+      for (const ball of _pb.balls) {
+        if (ball.dead || ball.inLane || ball.laneFeed || ball.onRamp) continue;
+        if (dist(ball.x, ball.y, h.x, h.y) < h.r + ball.r * 0.5) {
+          captureBallInTeleHole(ball, h, T);
+          break;
+        }
+      }
+    }
+  }
+
+  // ensure the right number of holes are cycling at this stage
+  const openOrCycling = T.teleHoles.filter(h => h.open || h.timer > 0).length;
+  if (openOrCycling < cfg.eligible) {
+    // pick a random idle hole and start its timer
+    const idle = T.teleHoles.filter(h => !h.open && h.timer <= 0 && !h.capturedBall);
+    if (idle.length) {
+      const pick = idle[Math.floor(rand(0, idle.length))];
+      pick.timer = Math.floor(rand(30, cfg.minCycle));
+    }
+  }
+}
+
+function captureBallInTeleHole(ball, hole, T) {
+  // hide the ball inside the hole and start hold timer
+  hole.capturedBall = ball;
+  hole.captureTimer = hole.holdFrames;
+  ball.x = hole.x; ball.y = hole.y;
+  ball.vx = 0; ball.vy = 0;
+  // mark ball so physics skips it while captured
+  ball._captured = true;
+  addScore(500 * _pb.mult);
+  dmdPlay(animTeleporter());
+}
+
+function ejectFromTeleHole(srcHole, T) {
+  const ball = srcHole.capturedBall;
+  if (!ball) return;
+  srcHole.capturedBall = null;
+  ball._captured = false;
+
+  // pick a random OTHER hole to eject from (prefer open ones, include secret)
+  const others = T.teleHoles.filter(h => h !== srcHole && !h.capturedBall);
+  let dest;
+  if (others.length) {
+    dest = others[Math.floor(rand(0, others.length))];
+  } else {
+    dest = srcHole; // fallback: eject from same hole
+  }
+
+  ball.x = dest.x;
+  ball.y = dest.y + dest.r + 4;
+  const a = rand(Math.PI * 0.15, Math.PI * 0.85);
+  const s = rand(6, 10);
+  ball.vx = Math.cos(a) * s;
+  ball.vy = Math.abs(Math.sin(a) * s);
+  ball.onRamp = null;
+  snd('warp');
+}
+
 
 /* ==========================================================================
  * SECTION 17 — GAME LOOP
  * ========================================================================== */
-function startGame() {
+function startGame(usingCredit = false) {
+  const keepCredits = _pb.credits || loadCredits();
   _pb = freshPB();
   _pb.highScore = loadHighScore(_table.id);
+  _pb.credits = usingCredit ? Math.max(0, keepCredits - 1) : keepCredits;
+  if (usingCredit) saveCredits(_pb.credits);
   _pb.phase = 'plunge';
   _pb.started = true;
   // reset table logic
   resetTableLogic(_table);
+  // game-start cutscene on the DMD, then hand control back to play readout
+  dmdPlayExclusive(animGameStart(_table));
   spawnBallInLane();
 }
 function resetTableLogic(T) {
@@ -1393,6 +2053,7 @@ function resetTableLogic(T) {
   for (const b of T.bumpers) { b.cooldown = 0; b.flash = 0; }
   for (const ln of T.lanes) { ln.lit = false; }
   if (T.lockZone) T.lockZone.active = true;
+  if (T.teleHoles) resetTeleHoles(T);
 }
 function spawnBallInLane() {
   const pl = _table.plunger;
@@ -1407,13 +2068,7 @@ function spawnBallInLane() {
 function loseBall() {
   _pb.combo = 0; _pb.mult = 1;
   if (_pb.ball >= _pb.ballsTotal) {
-    // GAME OVER
-    _pb.phase = 'gameover';
-    if (_pb.score > _pb.highScore) {
-      _pb.highScore = _pb.score;
-      saveHighScore(_table.id, _pb.score);
-    }
-    snd('gameover');
+    endGame();
   } else {
     _pb.ball++;
     _pb.phase = 'balllost';
@@ -1424,6 +2079,79 @@ function loseBall() {
       spawnBallInLane();
     }, 1600);
   }
+}
+
+/* End-of-game flow (sequenced through the DMD animation queue):
+ *   game-over cutscene
+ *   -> if score makes the table: initials entry (flipper-driven)
+ *   -> high-score celebration + free game
+ *   -> MATCH sequence (random 1-in-10) -> free game on match
+ *   -> return to attract reel
+ * The sequencing is driven in tick() by watching the queue drain and the
+ * _pb.endStage marker. */
+function endGame() {
+  _pb.phase = 'gameover';
+  const id = _table.id;
+  const isHigh = _pb.score > _pb.highScore;
+  if (_pb.score > _pb.highScore) _pb.highScore = _pb.score;
+  _pb.endStage = 'gameover';
+  _pb.endQualifies = qualifiesForTable(id, _pb.score);
+  dmdPlayExclusive(animGameOver(_table, _pb.score, isHigh));
+}
+// called from tick() when the game-over / post-game animations finish
+function advanceEndStage() {
+  const id = _table.id;
+  if (_pb.endStage === 'gameover') {
+    if (_pb.endQualifies) {
+      // enter initials
+      _pb.endStage = 'initials';
+      _pb.initials = { active: true, slot: 0, idx: 0, letters: ['A', 'A', 'A'] };
+      dmdPlayExclusive(animInitialsEntry());
+    } else {
+      _pb.endStage = 'match';
+      runMatchSequence();
+    }
+  } else if (_pb.endStage === 'initials') {
+    // initials confirmed elsewhere; commit + celebrate
+    const name = _pb.initials.letters.join('').replace(/ /g, 'A');
+    commitHighScore(id, name, _pb.score);
+    awardCredit('HIGH SCORE');
+    _pb.endStage = 'highscore';
+    dmdPlayExclusive(animHighScore(_pb.score));
+  } else if (_pb.endStage === 'highscore') {
+    _pb.endStage = 'match';
+    runMatchSequence();
+  } else if (_pb.endStage === 'match') {
+    if (_pb.matchWon) awardCredit('MATCH');
+    _pb.endStage = 'freegame';
+    if (_pb.pendingFreeGame) {
+      dmdPlayExclusive(animFreeGame(_pb.pendingFreeGame));
+      _pb.pendingFreeGame = null;
+    } else {
+      _pb.endStage = 'done';
+    }
+  } else if (_pb.endStage === 'freegame') {
+    _pb.endStage = 'done';
+  }
+  if (_pb.endStage === 'done') {
+    // back to attract
+    _pb.phase = 'attract';
+    _pb.endStage = null;
+    dmdPlayExclusive(animAttractReel(_table));
+  }
+}
+// the classic "match" — last digit of score vs a random digit, 1-in-10
+function runMatchSequence() {
+  const playerDigit = Math.floor(_pb.score / 10) % 10;
+  const matchDigit = Math.floor(Math.random() * 10);
+  _pb.matchWon = (playerDigit === matchDigit);
+  dmdPlayExclusive(animMatch(playerDigit, matchDigit, _pb.matchWon));
+}
+function awardCredit(reason) {
+  _pb.credits = (_pb.credits || 0) + 1;
+  saveCredits(_pb.credits);
+  _pb.pendingFreeGame = reason;       // shown after the match sequence
+  snd('pop');
 }
 function resetBallElementsForNewBall(T) {
   // worm holes / progress persist across balls (design choice — keeps it
@@ -1464,6 +2192,8 @@ function tick(now) {
     for (const b of _table.bumpers) { if (b.cooldown > 0) b.cooldown--; if (b.flash > 0) b.flash--; }
     for (const t of _table.targets) { if (t.flash > 0) t.flash--; }
     for (const wh of _table.wormholes) { wh.swirl += 0.08; }
+    // timed teleport holes open/close + capture
+    if (_table.teleHoles) stepTeleHoles(_table);
 
     for (const ball of _pb.balls) stepBall(ball, _table, colliders);
 
@@ -1476,6 +2206,13 @@ function tick(now) {
     // combo timer
     if (_pb.comboTimer > 0) { _pb.comboTimer--; if (_pb.comboTimer === 0) _pb.combo = 0; }
     if (_pb.shake > 0) _pb.shake *= 0.85;
+  }
+
+  // ---- end-of-game sequencing -----------------------------------------
+  // when a post-game cutscene finishes (queue drains), advance the flow.
+  if (_pb.phase === 'gameover' && _pb.endStage && _pb.endStage !== 'initials'
+      && _pb.endStage !== 'done' && !dmdBusy()) {
+    advanceEndStage();
   }
 
   // ---- dmd timer ----
@@ -1563,6 +2300,13 @@ function drawPlayfield() {
     ctx.arc(ln.x, ln.y, 9, 0, TAU);
     ctx.fillStyle = ln.lit ? T.colors.neon2 : 'rgba(255,255,255,0.15)';
     ctx.fill();
+  }
+
+  // ---- teleport holes (mechanical iris) ----
+  if (T.teleHoles) {
+    for (const h of T.teleHoles) {
+      drawTeleHole(ctx, h, T);
+    }
   }
 
   // ---- static colliders ----
@@ -1691,6 +2435,69 @@ function drawWormHole(ctx, wh) {
     ctx.strokeStyle = hexA('#5b4b9e', 0.4 + pulse * 0.2);
     ctx.lineWidth = 2;
     ctx.setLineDash([3, 5]); ctx.stroke(); ctx.setLineDash([]);
+  }
+  ctx.restore();
+}
+
+function drawTeleHole(ctx, h, T) {
+  ctx.save();
+  // outer ring — always visible (the "mechanical housing")
+  ctx.beginPath();
+  ctx.arc(h.x, h.y, h.r + 3, 0, TAU);
+  ctx.fillStyle = '#181828';
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = '#7f6faf';
+  ctx.stroke();
+
+  // iris animation — blades that open/close
+  const open = clamp(h.iris, 0, 1);
+  if (open > 0.02) {
+    // open hole glow
+    ctx.beginPath();
+    ctx.arc(h.x, h.y, h.r * open * 0.8, 0, TAU);
+    ctx.fillStyle = 'rgba(57,215,255,0.3)';
+    ctx.shadowColor = '#39d7ff'; ctx.shadowBlur = 12 * open;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    // iris blades (draw 6 wedge-shaped blades that retract when opening)
+    const blades = 6;
+    const closed = 1 - open;
+    for (let i = 0; i < blades; i++) {
+      const a = i * (TAU / blades) + _pb.tick * 0.02;
+      const inner = h.r * (1 - closed * 0.85);
+      const outer = h.r;
+      const hw = (TAU / blades) * 0.35 * closed; // blade half-width shrinks as it opens
+      ctx.beginPath();
+      ctx.moveTo(h.x + Math.cos(a - hw) * inner, h.y + Math.sin(a - hw) * inner);
+      ctx.lineTo(h.x + Math.cos(a - hw) * outer, h.y + Math.sin(a - hw) * outer);
+      ctx.lineTo(h.x + Math.cos(a + hw) * outer, h.y + Math.sin(a + hw) * outer);
+      ctx.lineTo(h.x + Math.cos(a + hw) * inner, h.y + Math.sin(a + hw) * inner);
+      ctx.closePath();
+      ctx.fillStyle = '#3a3552';
+      ctx.fill();
+    }
+  } else {
+    // fully closed — solid disc
+    ctx.beginPath();
+    ctx.arc(h.x, h.y, h.r, 0, TAU);
+    ctx.fillStyle = '#2a2540';
+    ctx.fill();
+  }
+
+  // label
+  ctx.fillStyle = h.open ? '#39d7ff' : '#7f6faf';
+  ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText(h.label, h.x, h.y + 3);
+
+  // captured ball indicator: a small pulsing dot
+  if (h.capturedBall) {
+    ctx.beginPath();
+    ctx.arc(h.x, h.y, 4 + Math.sin(_pb.tick * 0.3) * 2, 0, TAU);
+    ctx.fillStyle = '#ff3ea5';
+    ctx.shadowColor = '#ff3ea5'; ctx.shadowBlur = 8;
+    ctx.fill();
+    ctx.shadowBlur = 0;
   }
   ctx.restore();
 }
@@ -1901,31 +2708,41 @@ function newGrid() {
 }
 function drawDMD() {
   const ctx = _dmdCtx;
-  const grid = newGrid();
+  let grid = null;
   const T = _table;
 
-  if (_pb.dmd.timer > 0) {
-    // FLASH message takes over
-    dmdTextCentered(grid, _pb.dmd.msg.substring(0, 16), 5, 1);
-    if (_pb.dmd.sub) dmdTextCentered(grid, _pb.dmd.sub.substring(0, 16), 15, 1);
-  } else if (_pb.phase === 'attract') {
-    dmdTextCentered(grid, T.name.substring(0, 16), 3, 1);
-    dmdTextCentered(grid, 'PRESS LAUNCH', 13, (_pb.dmd.t >> 4) & 1);
-    dmdText(grid, 'HI ' + shortNum(loadHighScore(T.id)), 2, 21, 1);
-  } else if (_pb.phase === 'gameover') {
-    dmdTextCentered(grid, 'GAME OVER', 4, 1);
-    dmdTextCentered(grid, shortNum(_pb.score), 14, 1);
-  } else if (_pb.phase === 'balllost') {
-    dmdTextCentered(grid, 'BALL LOST', 6, 1);
-    dmdTextCentered(grid, 'BALL ' + _pb.ball, 16, 1);
-  } else {
-    // PLAY: score big, ball + mult on a status line
-    const scoreStr = shortNum(_pb.score);
-    dmdText(grid, scoreStr, Math.max(2, DMD.cols - scoreStr.length * 6 - 2), 3, 1);
-    dmdText(grid, 'BALL ' + _pb.ball + '/' + _pb.ballsTotal, 2, 3, 1);
-    dmdText(grid, 'X' + _pb.mult, 2, 14, 1);
-    if (_pb.combo > 1) dmdText(grid, 'COMBO ' + _pb.combo, 30, 14, 1);
-    if (_pb.balls.length > 1) dmdText(grid, _pb.balls.length + ' BALLS', 2, 21, ((_pb.dmd.t>>3)&1));
+  // priority: animation queue (cutscenes / attract / initials) wins, then
+  // the legacy flash message, then the plain phase-based readout.
+  if (dmdBusy()) {
+    grid = dmdStepAnim();
+  }
+  if (!grid) {
+    grid = newGrid();
+    if (_pb.dmd.timer > 0) {
+      // FLASH message takes over
+      dmdTextCentered(grid, _pb.dmd.msg.substring(0, 16), 5, 1);
+      if (_pb.dmd.sub) dmdTextCentered(grid, _pb.dmd.sub.substring(0, 16), 15, 1);
+    } else if (_pb.phase === 'attract') {
+      // attract should normally be the looping reel; this is a fallback
+      dmdTextCentered(grid, T.name.substring(0, 16), 3, 1);
+      dmdTextCentered(grid, 'PRESS LAUNCH', 13, (_pb.dmd.t >> 4) & 1);
+      dmdText(grid, 'HI ' + shortNum(loadHighScore(T.id)), 2, 21, 1);
+    } else if (_pb.phase === 'gameover') {
+      dmdTextCentered(grid, 'GAME OVER', 4, 1);
+      dmdTextCentered(grid, shortNum(_pb.score), 14, 1);
+    } else if (_pb.phase === 'balllost') {
+      dmdTextCentered(grid, 'BALL LOST', 6, 1);
+      dmdTextCentered(grid, 'BALL ' + _pb.ball, 16, 1);
+    } else {
+      // PLAY: score big, ball + mult on a status line
+      const scoreStr = shortNum(_pb.score);
+      dmdText(grid, scoreStr, Math.max(2, DMD.cols - scoreStr.length * 6 - 2), 3, 1);
+      dmdText(grid, 'BALL ' + _pb.ball + '/' + _pb.ballsTotal, 2, 3, 1);
+      dmdText(grid, 'X' + _pb.mult, 2, 14, 1);
+      if (_pb.combo > 1) dmdText(grid, 'COMBO ' + _pb.combo, 30, 14, 1);
+      if (_pb.balls.length > 1) dmdText(grid, _pb.balls.length + ' BALLS', 2, 21, ((_pb.dmd.t>>3)&1));
+      if (_pb.credits > 0) dmdText(grid, 'CR ' + _pb.credits, DMD.cols - 30, 21, 1);
+    }
   }
 
   // ---- render the grid as dots ----
@@ -1961,6 +2778,10 @@ function shortNum(n) {
 
 /* ==========================================================================
  * SECTION 20 — HIGH SCORE PERSISTENCE
+ * --------------------------------------------------------------------------
+ * Two layers: a single best score (legacy key, kept for the simple HUD) and
+ * a full top-5 table with 3-letter initials (used by the attract reel and
+ * the end-of-game initials entry).
  * ========================================================================== */
 function loadHighScore(id) {
   try { return parseInt(localStorage.getItem('pinball_hi_' + id) || '0', 10) || 0; }
@@ -1968,6 +2789,51 @@ function loadHighScore(id) {
 }
 function saveHighScore(id, score) {
   try { localStorage.setItem('pinball_hi_' + id, String(score)); } catch (e) {}
+}
+// default table shown before anyone has played
+function defaultHighTable() {
+  return [
+    { name: 'CRX', score: 120000 },
+    { name: 'NVA', score: 90000 },
+    { name: 'QBT', score: 60000 },
+    { name: 'ION', score: 35000 },
+    { name: 'AAA', score: 15000 },
+  ];
+}
+function loadHighTable(id) {
+  try {
+    const raw = localStorage.getItem('pinball_hitable_' + id);
+    if (!raw) return defaultHighTable();
+    const t = JSON.parse(raw);
+    if (Array.isArray(t) && t.length) return t;
+    return defaultHighTable();
+  } catch (e) { return defaultHighTable(); }
+}
+function saveHighTable(id, table) {
+  try { localStorage.setItem('pinball_hitable_' + id, JSON.stringify(table)); } catch (e) {}
+}
+// is this score good enough to make the top 5?
+function qualifiesForTable(id, score) {
+  const t = loadHighTable(id);
+  return score > 0 && (t.length < 5 || score > t[t.length - 1].score);
+}
+// insert a new {name,score} and keep the top 5
+function commitHighScore(id, name, score) {
+  const t = loadHighTable(id);
+  t.push({ name: (name || 'AAA').substring(0, 3), score });
+  t.sort((a, b) => b.score - a.score);
+  while (t.length > 5) t.pop();
+  saveHighTable(id, t);
+  if (score > loadHighScore(id)) saveHighScore(id, score);
+  return t;
+}
+// credit (free game) counter
+function loadCredits() {
+  try { return parseInt(localStorage.getItem('pinball_credits') || '0', 10) || 0; }
+  catch (e) { return 0; }
+}
+function saveCredits(n) {
+  try { localStorage.setItem('pinball_credits', String(Math.max(0, n))); } catch (e) {}
 }
 
 /* ==========================================================================
@@ -2056,8 +2922,8 @@ function buildUI() {
   const launchBtn = _ov.querySelector('.pb-launch');
   const closeBtn = _ov.querySelector('.pb-close');
 
-  bindHold(lBtn, () => setKey('left', true), () => setKey('left', false));
-  bindHold(rBtn, () => setKey('right', true), () => setKey('right', false));
+  bindHold(lBtn, () => onFlipperPress('L'), () => onFlipperRelease('L'));
+  bindHold(rBtn, () => onFlipperPress('R'), () => onFlipperRelease('R'));
   bindHold(launchBtn,
     () => { onLaunchPress(); launchBtn.classList.add('pb-held'); },
     () => { onLaunchRelease(); launchBtn.classList.remove('pb-held'); });
@@ -2091,10 +2957,57 @@ function bindHold(el, onDown, onUp) {
 
 function setKey(which, val) { _keys[which] = val; }
 
+/* During INITIALS entry the flipper buttons become a letter selector:
+ *   left flipper  = previous letter
+ *   right flipper = next letter
+ *   launch        = confirm slot (3rd confirm finishes entry)
+ * We edge-detect here so a press is one step, not a repeat. */
+function initialsInput(which) {
+  const st = _pb.initials;
+  if (!st || !st.active) return;
+  if (which === 'left' || which === 'right') {
+    st.idx = (st.idx + (which === 'right' ? 1 : -1) + INITIALS_ALPHABET.length)
+             % INITIALS_ALPHABET.length;
+    const ch = INITIALS_ALPHABET[st.idx];
+    st.letters[st.slot] = (ch === '<') ? ' ' : ch;
+    snd('cursor');
+  } else if (which === 'confirm') {
+    const ch = INITIALS_ALPHABET[st.idx];
+    if (ch === '<' && st.slot > 0) {
+      // back up a slot
+      st.slot--;
+      st.idx = INITIALS_ALPHABET.indexOf(st.letters[st.slot] || 'A');
+      if (st.idx < 0) st.idx = 0;
+      snd('cursor');
+      return;
+    }
+    if (ch === '<') { st.letters[st.slot] = 'A'; }
+    snd('confirm');
+    st.slot++;
+    if (st.slot >= 3) {
+      // done
+      st.active = false;
+      dmdClearQueue();
+      advanceEndStage();         // -> commit + celebrate
+    } else {
+      st.idx = INITIALS_ALPHABET.indexOf(st.letters[st.slot] || 'A');
+      if (st.idx < 0) st.idx = 0;
+    }
+  }
+}
+
 function onLaunchPress() {
   resumeAudio();
-  if (_pb.phase === 'attract' || _pb.phase === 'gameover') {
-    startGame();
+  // initials entry: launch confirms the current letter
+  if (_pb.initials && _pb.initials.active) { initialsInput('confirm'); return; }
+  if (_pb.phase === 'attract') {
+    // start a game; consume a credit if any are banked
+    const credit = (_pb.credits || 0) > 0;
+    startGame(credit);
+    return;
+  }
+  if (_pb.phase === 'gameover') {
+    // ignore launch until the post-game sequence has returned to attract
     return;
   }
   if (_pb.phase === 'plunge') _keys.space = true;
@@ -2105,13 +3018,24 @@ function onLaunchRelease() {
     launchBall();
   }
 }
+// flipper press entry point — routes to initials selector when entering name
+function onFlipperPress(side) {
+  if (_pb.initials && _pb.initials.active) {
+    initialsInput(side === 'L' ? 'left' : 'right');
+    return;
+  }
+  _keys[side === 'L' ? 'left' : 'right'] = true;
+}
+function onFlipperRelease(side) {
+  _keys[side === 'L' ? 'left' : 'right'] = false;
+}
 
 function onKeyDown(e) {
   if (e.repeat) return;
   resumeAudio();
   switch (e.key) {
-    case 'ArrowLeft':  _keys.left = true; e.preventDefault(); break;
-    case 'ArrowRight': _keys.right = true; e.preventDefault(); break;
+    case 'ArrowLeft':  onFlipperPress('L'); e.preventDefault(); break;
+    case 'ArrowRight': onFlipperPress('R'); e.preventDefault(); break;
     case ' ': case 'Spacebar':
       e.preventDefault();
       onLaunchPress();
@@ -2121,8 +3045,8 @@ function onKeyDown(e) {
 }
 function onKeyUp(e) {
   switch (e.key) {
-    case 'ArrowLeft':  _keys.left = false; break;
-    case 'ArrowRight': _keys.right = false; break;
+    case 'ArrowLeft':  onFlipperRelease('L'); break;
+    case 'ArrowRight': onFlipperRelease('R'); break;
     case ' ': case 'Spacebar': onLaunchRelease(); break;
   }
 }
@@ -2215,6 +3139,9 @@ export async function openPinball(tableId = 'worm_holer', state = null, data = n
 
   _pb.phase = 'attract';
   _pb.highScore = loadHighScore(_table.id);
+  _pb.credits = loadCredits();
+  // kick off the looping attract reel on the DMD
+  dmdPlayExclusive(animAttractReel(_table));
   _raf = requestAnimationFrame(tick);
 }
 
