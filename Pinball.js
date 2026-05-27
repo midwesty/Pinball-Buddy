@@ -20,6 +20,13 @@
  *             target with HP + downTimer, table-configurable laneFeedPath,
  *             T.onBallDrained ball-saver hook, T.onMultiHit/Down/Return callbacks,
  *             generic T.decor render slot. Stress: 298/300 drained, 0 escapes.
+ * v0.008.1  — BARF'S HOUSE unique DMD animations. Every shared animation
+ *             (attract reel title+tagline+scores+pressLaunch, game start,
+ *             game over, ball lock, multiball) now dispatches by table.id so
+ *             Barf's gets diner imagery instead of Worm Holer's black-hole/
+ *             space-stars theming. New DMD sprite primitives: dmdDinerSign,
+ *             dmdFryer (with rising bubbles), dmdOpenClosedSign, dmdCashRegister,
+ *             dmdChefHat. New sound cues: splash, crash.
  *
  * Single-file ES module. Exports openPinball().
  *
@@ -101,7 +108,7 @@ const PB = {
 // playfield bounding walls (used by every table)
 const WALL = { L: 26, R: 514, T: 26, DRAIN_Y: 944 };
 
-export const PB_VERSION = 'v0.008';
+export const PB_VERSION = 'v0.008.1';
 
 /* ==========================================================================
  * SECTION 3 — COLLIDER PRIMITIVES
@@ -414,6 +421,8 @@ function snd(name) {
     case 'gordonQuits':     [330,294,247,196,165].forEach((f,i)=>setTimeout(()=>tone(f,0.16,'sawtooth',0.14),i*80)); break;
     case 'thud':            tone(80, 0.18, 'sawtooth', 0.22); noise(0.1, 0.15, 200); break;
     case 'dishwasher':      noise(0.6, 0.13, 1200); [440,523,659,784].forEach((f,i)=>setTimeout(()=>tone(f,0.08,'sine',0.10),i*100)); break;
+    case 'splash':          noise(0.25, 0.12, 1500); [660, 990, 440].forEach((f,i)=>setTimeout(()=>tone(f,0.10,'sine',0.12),i*40)); break;
+    case 'crash':           noise(0.5, 0.18, 600); [220,180,140].forEach((f,i)=>setTimeout(()=>tone(f,0.18,'sawtooth',0.18),i*30)); break;
     // ---- Shower Defense cues -------------------------------------------
     case 'bugSquish':       noise(0.15, 0.18, 800); tone(180,0.10,'sawtooth',0.12,80); break;
     case 'moldSplat':       noise(0.25, 0.15, 400); break;
@@ -647,6 +656,8 @@ function dmdStars(grid, t, seed = 1) {
 
 // ---- EVENT ANIMATIONS (each ~180 frames / 3s) --------------------------
 function animGameStart(table) {
+  if (table && table.id === 'barfs_house') return animGameStartBarfs(table);
+  // default: Worm Holer / generic
   return {
     dur: 150, sound: 'gameStart',
     cues: [{ at: 70, snd: 'whoosh' }],
@@ -665,7 +676,38 @@ function animGameStart(table) {
     },
   };
 }
+
+// BARF'S HOUSE — door swings open, OPEN sign lights up, Bleeb appears
+function animGameStartBarfs(table) {
+  return {
+    dur: 180, sound: 'doorBell',
+    cues: [{ at: 60, snd: 'bell' }, { at: 110, snd: 'gameStart' }],
+    render(grid, p, t) {
+      // OPEN sign at top: blinks on at p=0.3
+      const signOn = p > 0.3;
+      if (signOn) dmdOpenClosedSign(grid, DMD.cols / 2, 4, true);
+      // Bleeb walks in from the right
+      if (p > 0.45) {
+        const bx = Math.floor(DMD.cols - 8 - (p - 0.45) * 90);
+        if (bx > 16) dmdBleeb(grid, bx, 14, ((t >> 3) & 1));
+      }
+      // diner marquee letters cascade after Bleeb arrives
+      if (p > 0.7) {
+        const name = "BARF'S HOUSE";
+        const w = dmdTextWidth(name);
+        const sx = Math.floor((DMD.cols - w) / 2);
+        const shown = Math.min(name.length, Math.floor((p - 0.7) * name.length * 4));
+        for (let i = 0; i < shown; i++) dmdText(grid, name[i], sx + i * 6, 22, 1);
+      }
+      if (p > 0.85) {
+        dmdText(grid, 'BALL 1', 4, 14, ((t >> 3) & 1));
+      }
+    },
+  };
+}
+
 function animGameOver(table, score, isHigh) {
+  if (table && table.id === 'barfs_house') return animGameOverBarfs(table, score, isHigh);
   return {
     dur: 200, sound: 'gameover',
     render(grid, p, t) {
@@ -679,7 +721,36 @@ function animGameOver(table, score, isHigh) {
     },
   };
 }
-function animBallLock() {
+
+// BARF'S HOUSE — CLOSED sign drops, Bleeb tips his hat
+function animGameOverBarfs(table, score, isHigh) {
+  return {
+    dur: 220, sound: 'gameover',
+    cues: [{ at: 30, snd: 'doorBell' }],
+    render(grid, p, t) {
+      // CLOSED sign drops in from top
+      const signY = Math.min(5, Math.floor(p * 14));
+      dmdOpenClosedSign(grid, DMD.cols / 2, signY, false);
+      // Bleeb tipping his hat (animated arm raise/lower)
+      const wave = ((t >> 3) & 1);
+      dmdBleeb(grid, 18, 16, wave);
+      // his chef hat above when arm is up
+      if (wave) dmdChefHat(grid, 18, 9);
+      // score display
+      if (p > 0.5) {
+        dmdText(grid, shortNum(score), DMD.cols - dmdTextWidth(shortNum(score)) - 6, 14, 1);
+      }
+      if (p > 0.7 && isHigh) {
+        dmdTextCentered(grid, 'GOOD TIPS!', 22, ((t >> 3) & 1));
+      } else if (p > 0.5) {
+        dmdTextCentered(grid, 'GAME OVER', 22, ((t >> 3) & 1));
+      }
+    },
+  };
+}
+
+function animBallLock(table) {
+  if (table && table.id === 'barfs_house') return animBallLockBarfs(table);
   return {
     dur: 165, sound: 'lock',
     cues: [{ at: 60, snd: 'clunk' }],
@@ -695,7 +766,35 @@ function animBallLock() {
     },
   };
 }
-function animMultiball() {
+
+// BARF'S HOUSE — plate drops INTO the fryer with rising bubbles
+function animBallLockBarfs(table) {
+  return {
+    dur: 180, sound: 'sizzle',
+    cues: [{ at: 50, snd: 'splash' }, { at: 110, snd: 'sizzle' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2;
+      // plate falls from top down toward fryer
+      if (p < 0.5) {
+        const py = Math.floor(2 + p * 22);
+        dmdPlate(grid, cx, py, 5);
+        dmdChickenLeg(grid, cx, py - 1);
+      }
+      // fryer at bottom
+      dmdFryer(grid, cx, 18, t);
+      // splash dots when plate hits (p around 0.45-0.55)
+      if (p > 0.45 && p < 0.6) {
+        for (let i = 0; i < 5; i++) {
+          dmdDot(grid, cx - 8 + i * 4, 15 + (i & 1), 1);
+        }
+      }
+      dmdTextCentered(grid, 'INTO THE FRYER', 24, ((t >> 3) & 1));
+    },
+  };
+}
+
+function animMultiball(table) {
+  if (table && table.id === 'barfs_house') return animMultiballBarfs(table);
   return {
     dur: 200, sound: 'multiball',
     cues: [{ at: 40, snd: 'whoosh' }, { at: 110, snd: 'pop' }],
@@ -711,6 +810,35 @@ function animMultiball() {
         dmdBall(grid, cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr * 0.6, 2);
       }
       dmdTextCentered(grid, 'MULTIBALL', 19, (t >> 2) & 1);
+    },
+  };
+}
+
+// BARF'S HOUSE — kitchen overrun, plates fly out in all directions
+function animMultiballBarfs(table) {
+  return {
+    dur: 220, sound: 'multiball',
+    cues: [{ at: 30, snd: 'crash' }, { at: 100, snd: 'crash' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2, cy = 12;
+      // Bleeb panics in center
+      dmdBleeb(grid, cx, cy, ((t >> 1) & 1));
+      // plates fly out radially
+      const n = 6;
+      for (let i = 0; i < n; i++) {
+        const ang = i * (TAU / n) + t * 0.04;
+        const rr = p * 38;
+        const px = cx + Math.cos(ang) * rr;
+        const py = cy + Math.sin(ang) * rr * 0.5;
+        dmdPlate(grid, px | 0, py | 0, 3);
+      }
+      // chicken legs scatter too
+      for (let i = 0; i < 3; i++) {
+        const ang = (i * (TAU / 3)) + Math.PI / 4 + t * 0.06;
+        const rr = p * 30;
+        dmdChickenLeg(grid, (cx + Math.cos(ang) * rr) | 0, (cy + Math.sin(ang) * rr * 0.5) | 0);
+      }
+      dmdTextCentered(grid, 'KITCHEN OVERRUN', 22, (t >> 2) & 1);
     },
   };
 }
@@ -854,6 +982,80 @@ function dmdPlate(grid, cx, cy, w = 8) {
     dmdDot(grid, cx + dx, cy + dy, 1);
   }
   dmdLine(grid, cx - w, cy, cx + w, cy, 1);
+}
+
+// Diner marquee sign — outer box, inner letters
+function dmdDinerSign(grid, x, y, w, h, text, blink) {
+  // outer marquee dots (alternating around the perimeter)
+  for (let i = 0; i < w; i += 2) {
+    dmdDot(grid, x + i, y, blink);
+    dmdDot(grid, x + i, y + h - 1, blink);
+  }
+  for (let i = 0; i < h; i += 2) {
+    dmdDot(grid, x, y + i, blink);
+    dmdDot(grid, x + w - 1, y + i, blink);
+  }
+  // text centered in box
+  const tw = dmdTextWidth(text);
+  dmdText(grid, text, x + Math.floor((w - tw) / 2), y + Math.floor((h - 5) / 2), 1);
+}
+
+// A fryer basket with bubbles
+function dmdFryer(grid, cx, cy, t) {
+  // basket outline (trapezoid-ish)
+  dmdLine(grid, cx - 6, cy - 4, cx + 6, cy - 4, 1);     // top
+  dmdLine(grid, cx - 5, cy + 4, cx + 5, cy + 4, 1);     // bottom
+  dmdLine(grid, cx - 6, cy - 4, cx - 5, cy + 4, 1);     // left slant
+  dmdLine(grid, cx + 6, cy - 4, cx + 5, cy + 4, 1);     // right slant
+  // mesh grid inside
+  for (let i = -3; i <= 3; i += 2) {
+    dmdDot(grid, cx + i, cy - 1, 1);
+    dmdDot(grid, cx + i, cy + 1, 1);
+  }
+  // bubbles rising (animated by t)
+  for (let i = 0; i < 5; i++) {
+    const phase = (t + i * 12) % 60;
+    const by = cy - 4 - Math.floor(phase / 5);
+    const bx = cx - 4 + (i * 2);
+    if (by > cy - 10 && by < cy - 4) dmdDot(grid, bx, by, 1);
+  }
+}
+
+// OPEN / CLOSED door sign
+function dmdOpenClosedSign(grid, cx, cy, open) {
+  const txt = open ? 'OPEN' : 'CLOSED';
+  const w = dmdTextWidth(txt) + 4;
+  const h = 9;
+  dmdBox(grid, cx - Math.floor(w/2), cy - Math.floor(h/2), w, h, 1);
+  dmdText(grid, txt, cx - Math.floor(dmdTextWidth(txt)/2), cy - 2, 1);
+}
+
+// Cash register with optional open drawer
+function dmdCashRegister(grid, cx, cy, drawerOut) {
+  // base
+  dmdBox(grid, cx - 5, cy - 2, 11, 6, 1);
+  // top
+  dmdBox(grid, cx - 4, cy - 6, 9, 4, 1);
+  // keys (3 dots)
+  dmdDot(grid, cx - 2, cy + 1, 1);
+  dmdDot(grid, cx, cy + 1, 1);
+  dmdDot(grid, cx + 2, cy + 1, 1);
+  // drawer when out
+  if (drawerOut) {
+    dmdBox(grid, cx - 7, cy + 4, 5, 3, 1);
+    dmdDot(grid, cx - 6, cy + 5, 1); // $
+    dmdDot(grid, cx - 4, cy + 5, 1);
+  }
+}
+
+// Chef's hat (perched on top of something)
+function dmdChefHat(grid, cx, cy) {
+  // hat brim
+  dmdLine(grid, cx - 3, cy + 1, cx + 3, cy + 1, 1);
+  // hat puff
+  dmdCircle(grid, cx - 2, cy - 1, 2, 1, true);
+  dmdCircle(grid, cx + 2, cy - 1, 2, 1, true);
+  dmdCircle(grid, cx, cy - 2, 2, 1, true);
 }
 
 function animOrderUp() {
@@ -1115,6 +1317,7 @@ function animAttractReel(table) {
   };
 }
 function attractTitle(grid, p, t, table) {
+  if (table && table.id === 'barfs_house') return attractTitleBarfs(grid, p, t, table);
   dmdStars(grid, t, 2);
   dmdBlackHole(grid, DMD.cols / 2, 11, t * 1.5, 1);
   const name = table.name.toUpperCase().substring(0, 16);
@@ -1126,7 +1329,28 @@ function attractTitle(grid, p, t, table) {
     dmdText(grid, name[i], sx + i * 6, 17, 1);
   }
 }
+// BARF'S — Bleeb under a flashing diner sign, letters cascade
+function attractTitleBarfs(grid, p, t, table) {
+  // big marquee sign at top
+  const sw = 70, sh = 9;
+  const sx = Math.floor((DMD.cols - sw) / 2);
+  dmdDinerSign(grid, sx, 2, sw, sh, "BLEEB'S", ((t >> 3) & 1));
+  // Bleeb dances center, swapping arm wave
+  dmdBleeb(grid, DMD.cols / 2, 17, ((t >> 2) & 1));
+  // chef hat on top of Bleeb
+  dmdChefHat(grid, DMD.cols / 2, 11);
+  // name letters cascade in below
+  const name = "BARF'S HOUSE";
+  const w = dmdTextWidth(name);
+  const ssx = Math.floor((DMD.cols - w) / 2);
+  const shown = Math.min(name.length, Math.floor(p * name.length * 1.6));
+  for (let i = 0; i < shown; i++) {
+    dmdText(grid, name[i], ssx + i * 6, 24, 1);
+  }
+}
+
 function attractTagline(grid, p, t, table) {
+  if (table && table.id === 'barfs_house') return attractTaglineBarfs(grid, p, t, table);
   dmdStars(grid, t, 4);
   const sub = (table.subtitle || 'QUANTUM PINBALL').toUpperCase();
   // typewriter reveal
@@ -1134,8 +1358,24 @@ function attractTagline(grid, p, t, table) {
   dmdTextCentered(grid, sub.substring(0, shown), 8, 1);
   if (p > 0.6) dmdTextCentered(grid, 'BEND SPACE - WIN BIG', 16, (t >> 3) & 1);
 }
+// BARF'S — plate slides across; tagline reveals
+function attractTaglineBarfs(grid, p, t, table) {
+  // plate slides across the screen carrying a chicken leg
+  const px = Math.floor(-10 + p * (DMD.cols + 20));
+  dmdPlate(grid, px, 7, 6);
+  dmdChickenLeg(grid, px, 6);
+  // Bleeb on far left, watches
+  dmdBleeb(grid, 10, 9, ((t >> 3) & 1));
+  // tagline typewriter
+  const sub = "BLEEB'S DINER";
+  const shown = Math.min(sub.length, Math.floor(p * sub.length * 1.5));
+  dmdTextCentered(grid, sub.substring(0, shown), 17, 1);
+  if (p > 0.6) dmdTextCentered(grid, 'SERVE - TIP - REPEAT', 23, (t >> 3) & 1);
+}
+
 function attractScores(grid, p, t, table) {
-  dmdTextCentered(grid, 'BEST PHYSICISTS', 2, 1);
+  const header = (table && table.id === 'barfs_house') ? 'TOP TIPPERS' : 'BEST PHYSICISTS';
+  dmdTextCentered(grid, header, 2, 1);
   const tbl = loadHighTable(table.id);
   // show 5 rows, slow vertical scroll through them
   const rowH = 8;
@@ -1156,10 +1396,23 @@ function attractHowTo(grid, p, t) {
   dmdTextCentered(grid, 'TO CHARGE PLUNGER', 19, (t >> 3) & 1);
 }
 function attractPressLaunch(grid, p, t, table) {
+  if (table && table.id === 'barfs_house') return attractPressLaunchBarfs(grid, p, t, table);
   dmdStars(grid, t, 6);
   dmdTextCentered(grid, (table ? table.name.toUpperCase() : 'PINBALL').substring(0, 16), 4, 1);
   dmdBox(grid, 22, 12, DMD.cols - 44, 11, 1);
   dmdTextCentered(grid, 'PRESS LAUNCH', 15, (t >> 3) & 1);
+}
+// BARF'S — Bleeb holding a plate, prompts player to launch
+function attractPressLaunchBarfs(grid, p, t, table) {
+  // Bleeb on the left holding a plate up
+  dmdBleeb(grid, 14, 13, 1);
+  dmdPlate(grid, 22, 10, 4);
+  // cash register on the right
+  dmdCashRegister(grid, DMD.cols - 14, 14, ((t >> 4) & 1));
+  // box + text in middle
+  dmdBox(grid, 30, 4, DMD.cols - 60, 8, 1);
+  dmdTextCentered(grid, "BARF'S HOUSE", 7, 1);
+  dmdTextCentered(grid, 'PRESS LAUNCH', 21, (t >> 3) & 1);
 }
 
 /* ==========================================================================
@@ -3109,7 +3362,7 @@ function onBallLock(ball, T) {
     // START MULTIBALL
     T.lockZone.active = false;
     T.multiballArmed = false;
-    dmdPlay(animMultiball());
+    dmdPlay(animMultiball(T));
     storyBeat('multiball', T);
     _pb.mult = Math.max(_pb.mult, 2);
     // ball that entered is re-ejected, plus 2 more spawn
@@ -3125,7 +3378,7 @@ function onBallLock(ball, T) {
     // not armed: lock just scores + kicks ball out
     addScore(2000 * _pb.mult);
     onShotEvent('lock', null, T);
-    dmdPlay(animBallLock());
+    dmdPlay(animBallLock(T));
     ejectFromLock(ball, T);
   }
 }

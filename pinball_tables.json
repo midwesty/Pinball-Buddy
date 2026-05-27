@@ -1,0 +1,38 @@
+{
+  "schema": "pinball-buddy/tables/1",
+  "tables": [
+    {
+      "id": "worm_holer",
+      "name": "WORM HOLER",
+      "subtitle": "Quantum Pinball",
+      "status": "playable",
+      "theme": "Black holes, deep space, quantum entanglement",
+      "colors": {
+        "bg": "#0a0a1f", "mid": "#1a1145", "neon": "#ff3ea5",
+        "neon2": "#39d7ff", "wall": "#5b4b9e"
+      }
+    },
+    {
+      "id": "barfs_house",
+      "name": "BARF'S HOUSE",
+      "subtitle": "Bleeb's Diner",
+      "status": "playable",
+      "theme": "80s sitcom parody, alien chef Bleeb runs a chicken diner. Kitchen mini-playfield, Gordon mechanical target, Tip Jar signature toy.",
+      "colors": {
+        "bg": "#2a1408", "mid": "#5e2a14", "neon": "#ffb330",
+        "neon2": "#6dd44a", "wall": "#9b5a2c", "decor": "#ff5a4c"
+      }
+    },
+    {
+      "id": "shower_defense",
+      "name": "SHOWER DEFENSE",
+      "subtitle": "Tower Defense Parody",
+      "status": "playable",
+      "theme": "Bathroom invaded by bugs and mold, tower defense parody",
+      "colors": {
+        "bg": "#031820", "mid": "#0a3848", "neon": "#2ee8e8",
+        "neon2": "#7ec8ff", "wall": "#3f7f8a", "decor": "#a8e8e8"
+      }
+    }
+  ]
+}
