@@ -9,6 +9,17 @@
  * v0.007    — COSMIC CLUCKERS (alien diner, upper-deck booths, sitcom beats)
  *             and SHOWER DEFENSE (waves, shower toggle, drain beast). Shared
  *             cabinet frame, table-driven dispatch (onBankComplete, onLanesComplete).
+ * v0.008    — BARF'S HOUSE unique-geometry rewrite. Cabinet built from scratch
+ *             (no shared base helper): LEFT plunger lane + custom feed path,
+ *             top-left deflector arc, kitchen mini-playfield walled off top-right
+ *             with its own upper flipper, pass window, FRYER lock inside kitchen,
+ *             ORDER vertical bank, perimeter booth bumpers (no center cluster),
+ *             GORDON multi-hit mechanical target, TIP JAR signature toy that
+ *             fills with money, DISHWASHER drain with ball-saver chance, ball
+ *             renders as a PLATE on this table. Engine additions: multiHit
+ *             target with HP + downTimer, table-configurable laneFeedPath,
+ *             T.onBallDrained ball-saver hook, T.onMultiHit/Down/Return callbacks,
+ *             generic T.decor render slot. Stress: 298/300 drained, 0 escapes.
  *
  * Single-file ES module. Exports openPinball().
  *
@@ -90,7 +101,7 @@ const PB = {
 // playfield bounding walls (used by every table)
 const WALL = { L: 26, R: 514, T: 26, DRAIN_Y: 944 };
 
-export const PB_VERSION = 'v0.007';
+export const PB_VERSION = 'v0.008';
 
 /* ==========================================================================
  * SECTION 3 — COLLIDER PRIMITIVES
@@ -400,6 +411,9 @@ function snd(name) {
     case 'doorBell':        [659, 523].forEach((f,i)=>setTimeout(()=>tone(f,0.25,'sine',0.16),i*180)); break;
     case 'cashRegister':    [1318,988,1568].forEach((f,i)=>setTimeout(()=>tone(f,0.12,'square',0.14),i*60)); noise(0.15,0.10,2000); break;
     case 'sizzle':          noise(0.4, 0.12, 3000); break;
+    case 'gordonQuits':     [330,294,247,196,165].forEach((f,i)=>setTimeout(()=>tone(f,0.16,'sawtooth',0.14),i*80)); break;
+    case 'thud':            tone(80, 0.18, 'sawtooth', 0.22); noise(0.1, 0.15, 200); break;
+    case 'dishwasher':      noise(0.6, 0.13, 1200); [440,523,659,784].forEach((f,i)=>setTimeout(()=>tone(f,0.08,'sine',0.10),i*100)); break;
     // ---- Shower Defense cues -------------------------------------------
     case 'bugSquish':       noise(0.15, 0.18, 800); tone(180,0.10,'sawtooth',0.12,80); break;
     case 'moldSplat':       noise(0.25, 0.15, 400); break;
@@ -880,6 +894,59 @@ function animBossVisit() {
 
 // Tips raining (a brief mode-start cutscene the engine doesn't run unless we
 // call dmdPlay directly — left available for callers)
+// Gordon falls over — knocked out animation
+function animGordonDown() {
+  return {
+    dur: 160, sound: 'gordonQuits',
+    cues: [{ at: 50, snd: 'whoosh' }, { at: 90, snd: 'thud' }],
+    render(grid, p, t) {
+      // Gordon silhouette tips over from vertical to horizontal
+      const baseX = DMD.cols / 2;
+      const tipAng = Math.min(1, p * 1.3) * (Math.PI / 2);
+      // body coordinates rotate around (baseX, 22) (his feet)
+      const headLen = 12;
+      const headX = baseX + Math.sin(tipAng) * headLen;
+      const headY = 22 - Math.cos(tipAng) * headLen;
+      // body line
+      dmdLine(grid, baseX, 22, headX | 0, headY | 0, 1);
+      // head circle
+      dmdCircle(grid, headX | 0, headY | 0, 3, 1, true);
+      // stars when he hits the ground
+      if (p > 0.7) {
+        for (let i = 0; i < 4; i++) {
+          const sx = headX + Math.cos(i * TAU / 4 + t * 0.2) * 6;
+          const sy = headY + Math.sin(i * TAU / 4 + t * 0.2) * 4;
+          dmdDot(grid, sx | 0, sy | 0, 1);
+        }
+      }
+      dmdTextCentered(grid, 'GORDON QUITS', 3, ((t >> 3) & 1));
+    },
+  };
+}
+
+// Tip Jar jackpot — coins explode out
+function animTipJackpot() {
+  return {
+    dur: 170, sound: 'cashRegister',
+    cues: [{ at: 30, snd: 'pop' }, { at: 80, snd: 'pop' }],
+    render(grid, p, t) {
+      dmdTextCentered(grid, 'TIP JACKPOT', 4, 1);
+      // jar at bottom, $ explode upward
+      const jx = DMD.cols / 2;
+      dmdBox(grid, jx - 5, 18, 10, 8, 1);  // jar
+      for (let i = 0; i < 8; i++) {
+        const ang = (i * TAU / 8) - Math.PI / 2;
+        const rr = p * 25;
+        const cx = jx + Math.cos(ang) * rr;
+        const cy = 18 + Math.sin(ang) * rr;
+        dmdDot(grid, cx | 0, cy | 0, 1);
+        dmdDot(grid, (cx + 1) | 0, cy | 0, 1);
+      }
+      dmdTextCentered(grid, '+25000', 23, ((t >> 3) & 1));
+    },
+  };
+}
+
 function animTipsRain() {
   return {
     dur: 150, sound: 'cashRegister',
@@ -1637,130 +1704,258 @@ function makeBaseTable(id, tdef, defaults) {
 }
 
 /* ==========================================================================
- * SECTION 10c — TABLE: COSMIC CLUCKERS
+ * SECTION 10c — TABLE: BARF'S HOUSE
  * --------------------------------------------------------------------------
- * Theme: 80s sitcom parody. BLEEB, a green alien chef, runs an Earth chicken
- * restaurant. The playfield IS the restaurant — dining floor below, an
- * upper booth deck reachable via ramps, kitchen pass with grill bumpers,
- * and the FRYER lock zone for the multiball "fryer overflow".
+ * Bleeb the green alien chef runs a chicken diner. The playfield IS the
+ * restaurant. UNIQUE layout (not a re-skin):
  *
- * Unique mechanics:
- *   - UPPER DECK: real Z-axis ramps lift the ball over decorative booths
- *     drawn below the ramps. Booth circles are rollover-style targets the
- *     ball triggers when delivered from above.
- *   - ORDER drop-target bank (5 letters) advances customer service.
- *   - TIPS drop-target bank (4 letters) awards jackpots.
- *   - GRILL bumpers fire sizzle sounds and accelerate during BUMPER FRENZY.
- *   - Story beats narrate Bleeb running the diner.
+ *   - LEFT plunger lane — ball is "delivered" via the back alley.
+ *     Custom lane-feed path arcs it up-right into the dining floor.
+ *   - KITCHEN MINI-PLAYFIELD walled off in the top-right with its own
+ *     upper flipper (right button), two grill bumpers, FRYER lock zone,
+ *     and the GORDON multi-hit standing target.
+ *   - PASS WINDOW at the bottom of the kitchen wall — ball travels
+ *     between kitchen and dining through this opening.
+ *   - One ramp: KITCHEN RAMP, climbs from right-side of dining floor up
+ *     and over the kitchen wall, ejecting into the kitchen.
+ *   - Booth bumpers spread around the dining room perimeter (NOT a center
+ *     cluster — the center is left clear for the TIP JAR signature toy).
+ *   - TIP JAR sits center-top of the dining room. Fills with money as
+ *     orders + Gordon hits + bumper hits accumulate; when full = JACKPOT.
+ *   - Slingshots at different angles than Worm Holer (asymmetric).
+ *   - DISHWASHER drain visual under the flippers, with a ball-saver chance
+ *     when a ball drains during early play.
+ *   - The ball renders as a PLATE in this table (small white disc with rim).
+ *
+ * Sitcom tropes (no real-show references): catchphrase repeats, manager
+ * boss-visit beats, "employee of the month" victory, laugh-track sounds.
  * ========================================================================== */
-function buildCosmicCluckers(tdef) {
-  const T = makeBaseTable('cosmic_cluckers', tdef, {
-    name: 'COSMIC CLUCKERS',
-    subtitle: "Bleeb's Diner",
-    colors: { bg:'#2a1408', mid:'#5e2a14', neon:'#ffb330', neon2:'#6dd44a',
-              wall:'#9b5a2c', decor:'#ff5a4c' },
+function buildBarfsHouse(tdef) {
+  const T = {
+    id: 'barfs_house',
+    name: tdef?.name || "BARF'S HOUSE",
+    subtitle: tdef?.subtitle || "Bleeb's Diner",
+    colors: tdef?.colors || { bg:'#2a1408', mid:'#5e2a14', neon:'#ffb330',
+                              neon2:'#6dd44a', wall:'#9b5a2c', decor:'#ff5a4c' },
+    staticColliders: [],
+    flippers: [],
+    bumpers: [],
+    targets: [],
+    ramps: [],
+    wormholes: [],
+    posts: [],
+    lanes: [],
+    spinners: [],
+    lockZone: null,
+    teleHoles: null,
+    upperDeck: [],
+    decor: [],
+    activeHoles: 0,
+    multiballArmed: false,
+    locked: 0,
+  };
+  const W = WALL;
+
+  /* ---- OUTER CABINET — irregular shape (angled corners, asymmetric) --- */
+  // Top wall (with angled corners — distinctive shape)
+  T.staticColliders.push(
+    seg(60, 26, 480, 26, { r:4, role:'wall', color:T.colors.wall }),
+    seg(26, 60, 60, 26, { r:4, role:'wall', color:T.colors.wall }),
+    seg(480, 26, 514, 60, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // Right wall (full height — no plunger here)
+  T.staticColliders.push(
+    seg(514, 60, 514, 760, { r:4, role:'wall', color:T.colors.wall }),
+    seg(514, 760, 470, 870, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // Left wall above plunger-lane top (cabinet edge)
+  T.staticColliders.push(
+    seg(26, 60, 26, 200, { r:4, role:'wall', color:T.colors.wall }),
+    // Plunger lane outer edge (cabinet left, full bottom)
+    seg(26, 200, 26, 944, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // Left INNER wall (separates plunger lane from playfield)
+  T.staticColliders.push(
+    seg(70, 210, 70, 760, { r:4, role:'wall', color:T.colors.wall }),
+    // Left outlane diagonal — drained balls slide into the plunger lane area
+    seg(70, 760, 110, 870, { r:4, role:'wall', color:T.colors.wall }),
+  );
+
+  /* ---- LEFT-SIDE TOP DEFLECTOR (curves plunged ball up-right into play) */
+  // Mirrors the Worm Holer top-right hood, on the left side. Each segment
+  // is part of a smooth arc carrying the ball from the lane mouth at
+  // (46, 200) up and right into the dining area at ~(228, 214).
+  T.staticColliders.push(
+    seg(40, 200, 52, 130, { r:4, role:'wall', color:T.colors.wall }),
+    seg(52, 130, 100, 60,  { r:4, role:'wall', color:T.colors.wall }),
+    seg(100, 60, 168, 40,  { r:4, role:'wall', color:T.colors.wall }),
+    seg(168, 40, 240, 60,  { r:4, role:'wall', color:T.colors.wall }),
+    // Inner kicker lip pulling the ball off the deflector
+    seg(26, 206, 64, 180, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // one-way gate that blocks the ball from re-entering the lane mid-feed
+  T.laneGate = seg(70, 216, 26, 202, { r:4, role:'gate', color:T.colors.wall, active:true });
+
+  /* ---- CUSTOM LANE-FEED PATH (mirrors right-side feed, on the left) --- */
+  T.laneFeedPath = [
+    { x: 46,  y: 206 },   // lane mouth (left)
+    { x: 48,  y: 150 },   // up past the gate
+    { x: 70,  y: 96  },   // over the deflector crest
+    { x: 110, y: 74  },   // across the top
+    { x: 168, y: 96  },   // descending right
+    { x: 208, y: 150 },   // into open dining field
+    { x: 228, y: 214 },   // clear of the channel — release here
+  ];
+
+  /* ---- PLUNGER (on the LEFT — back-alley delivery) -------------------- */
+  T.plunger = {
+    x: 46, top: 200, bottom: 944, headRest: 920, headDeep: 940,
+    headY: 920,
+  };
+
+  /* ---- KITCHEN MINI-PLAYFIELD WALLS (top-right interior) -------------- */
+  // The kitchen is bounded by the cabinet (top + right) and these two
+  // interior walls. There is a PASS WINDOW gap in the bottom wall.
+  T.staticColliders.push(
+    // Kitchen LEFT wall (vertical interior wall separating dining from kitchen)
+    seg(310, 70, 310, 280, { r:4, role:'kitchen-wall', color:T.colors.decor }),
+    // Kitchen BOTTOM wall — solid section LEFT of pass window
+    seg(310, 280, 370, 280, { r:4, role:'kitchen-wall', color:T.colors.decor }),
+    // Kitchen BOTTOM wall — solid section RIGHT of pass window
+    seg(440, 280, 514, 280, { r:4, role:'kitchen-wall', color:T.colors.decor }),
+  );
+  // The pass-window gap is x=370 to x=440 — open
+
+  /* ---- MAIN FLIPPERS (standard bottom position — proven physics) ----- */
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'main', px:176, py:812, len:84, r:9,
+      rest: 0.50, active: 0.50 - 0.95, speed: 0.62 }),
+    makeFlipper({ side:'R', group:'main', px:364, py:812, len:84, r:9,
+      rest: Math.PI - 0.50, active: Math.PI - 0.50 + 0.95, speed: 0.62 }),
+  );
+
+  /* ---- UPPER KITCHEN FLIPPER (right button activates) ----------------- */
+  // Inside the kitchen mini-playfield, bottom-right area. Catches falling
+  // balls and flicks them up at Gordon + the grill bumpers.
+  T.flippers.push(
+    makeFlipper({ side:'R', group:'kitchen', px:445, py:240, len:50, r:8,
+      rest: Math.PI - 0.45, active: Math.PI - 0.45 + 0.85, speed: 0.72 }),
+  );
+
+  /* ---- SLINGSHOTS (different angles than Worm Holer — asymmetric) ---- */
+  // LEFT sling: steeper / more vertical
+  T.staticColliders.push(
+    seg(108, 680, 152, 798, { r:6, role:'sling', bounce:1.55, color:T.colors.neon }),
+  );
+  // RIGHT sling: shallower / more horizontal (different from left!)
+  T.staticColliders.push(
+    seg(452, 700, 380, 790, { r:6, role:'sling', bounce:1.40, color:T.colors.neon }),
+  );
+  // sling kicker posts
+  T.posts.push(
+    circle(108, 680, 8, { role:'post', color:T.colors.wall }),
+    circle(452, 700, 8, { role:'post', color:T.colors.wall }),
+  );
+  // inlane rails leading to flipper pivots
+  T.staticColliders.push(
+    seg(152, 798, 176, 812, { r:3, role:'wall', color:T.colors.wall }),
+    seg(380, 790, 364, 812, { r:3, role:'wall', color:T.colors.wall }),
+  );
+
+  /* ---- BOOTH BUMPERS (3 — spread around the dining perimeter) -------- */
+  // Not a center cluster! Each bumper is in its own corner of the dining floor.
+  T.bumpers.push(
+    { id:'booth_1', x:200, y:380, r:24, cooldown:0, flash:0, value:280, role:'booth' },
+    { id:'booth_2', x:240, y:600, r:24, cooldown:0, flash:0, value:280, role:'booth' },
+    { id:'booth_3', x:320, y:640, r:24, cooldown:0, flash:0, value:280, role:'booth' },
+  );
+
+  /* ---- GRILL BUMPERS (2 — inside the kitchen mini-playfield) --------- */
+  T.bumpers.push(
+    { id:'grill_1', x:360, y:140, r:20, cooldown:0, flash:0, value:340, role:'grill' },
+    { id:'grill_2', x:430, y:140, r:20, cooldown:0, flash:0, value:340, role:'grill' },
+  );
+
+  /* ---- GORDON THE MANAGER — multi-hit mechanical target (in kitchen) - */
+  // 3 hits to "knock him out". He returns after ~10s.
+  T.targets.push({
+    letter: 'G', group: 'gordon', x: 480, y: 210, w: 14, h: 50,
+    vertical: true, hit: false, flash: 0, value: 1500,
+    multiHit: true, hp: 3, maxHp: 3, downTimer: 0,
+    isGordon: true,
   });
 
-  /* ---- GRILL BUMPERS (3, fan cluster, mid-table) ---- */
-  // These are the diner's grill burners — they pop with sizzle when hit.
-  const grillDefs = [
-    { x: 200, y: 410, r: 26 },   // left burner
-    { x: 320, y: 410, r: 26 },   // right burner
-    { x: 260, y: 318, r: 26 },   // back burner
-  ];
-  for (const bd of grillDefs) {
-    T.bumpers.push({ x: bd.x, y: bd.y, r: bd.r, cooldown:0, flash:0, value: 300, role:'grill' });
-  }
-
-  /* ---- ORDER bank (5 horizontal drop targets, lower mid) ---- */
+  /* ---- ORDER drop-target bank (5 VERTICAL targets on the left side) -- */
+  // Vertical orientation — balls deflect off the face, can't settle on top.
   const orderBank = makeTargetBank({
-    word: 'ORDER', x: 116, y: 600, dx: 62, dy: 0, w: 38, h: 28,
-    vertical: false, group: 'order', value: 600,
+    word: 'ORDER', x: 92, y: 380, dx: 0, dy: 38, w: 28, h: 30,
+    vertical: true, group: 'order', value: 600,
   });
   T.targets.push(...orderBank);
 
-  /* ---- TIPS bank (4 vertical drop targets, right side) ---- */
-  const tipsBank = makeTargetBank({
-    word: 'TIPS', x: 96, y: 230, dx: 0, dy: 36, w: 30, h: 30,
-    vertical: true, group: 'tips', value: 700,
-  });
-  T.targets.push(...tipsBank);
+  /* ---- FRYER lock zone (INSIDE the kitchen, top-center of kitchen) --- */
+  T.lockZone = { x: 365, y: 110, r: 18, active: true, label: 'FRYER' };
 
-  /* ---- UPPER DECK BOOTHS (rollover circles, drawn through translucent ramp) ---- */
-  // Four booths in the upper deck — when the ball is delivered up here via
-  // a ramp it passes over them and counts as "serving customers".
-  T.upperDeck = [
-    { kind: 'booth', x: 180, y: 200, r: 18, label: '1', served: false, flash: 0 },
-    { kind: 'booth', x: 250, y: 170, r: 18, label: '2', served: false, flash: 0 },
-    { kind: 'booth', x: 320, y: 170, r: 18, label: '3', served: false, flash: 0 },
-    { kind: 'booth', x: 390, y: 200, r: 18, label: '4', served: false, flash: 0 },
-    // Decorative neon sign + plant
-    { kind: 'sign', x: 270, y: 90, w: 220, h: 28, text: "BLEEB'S", blink: 0 },
-    { kind: 'plant', x: 80, y: 110, r: 14 },
-  ];
+  /* ---- TIP JAR signature toy (visual decor at center-top of dining) -- */
+  // Not a collider — purely visual. Fills with money as score accumulates.
+  T.tipJar = {
+    x: 210, y: 110, w: 50, h: 80,
+    level: 0,         // 0..100
+    flash: 0,
+  };
+  T.decor.push({ kind:'tipjar', ref: T.tipJar });
+  // Decorative neon sign above the dining area
+  T.decor.push({ kind:'sign', x: 200, y: 230, w: 200, h: 22, text: "BLEEB'S" });
 
-  /* ---- LOCK ZONE — THE FRYER (top center) ---- */
-  T.lockZone = { x: 270, y: 130, r: 22, active: true, label: 'FRYER' };
+  /* ---- DISHWASHER DRAIN visual (decorative, under flippers) ---------- */
+  T.dishwasher = {
+    x: 270, y: 922, w: 200, h: 28,
+    saveChance: 0.30,        // 30% ball-saver chance
+    spin: 0,                 // animation phase
+    saveFlash: 0,
+  };
+  T.decor.push({ kind:'dishwasher', ref: T.dishwasher });
 
-  /* ---- RAMPS (two distinct ramps to the upper deck) ---- */
-  // KITCHEN RAMP — left side, climbs over the booths, ejects right inlane
+  /* ---- KITCHEN RAMP (only ramp — climbs from dining into kitchen) ---- */
+  // Entry on the right side of the dining floor, climbs up and to the
+  // right, crosses over the kitchen left wall, ejects INSIDE the kitchen.
   T.ramps.push(makeRamp({
     id: 'kitchen_ramp',
     path: [
-      { x: 110, y: 640 }, { x: 90, y: 520 }, { x: 110, y: 380 },
-      { x: 170, y: 260 }, { x: 270, y: 180 }, { x: 380, y: 230 },
-      { x: 430, y: 360 }, { x: 430, y: 500 }, { x: 420, y: 640 },
+      { x: 420, y: 640 },
+      { x: 440, y: 540 },
+      { x: 450, y: 420 },
+      { x: 420, y: 340 },
+      { x: 370, y: 260 },
+      { x: 340, y: 180 },
+      { x: 340, y: 110 },
     ],
-    width: 30, h0: 0, h1: 64, exitBoost: 7, mountSpeed: 7,
+    width: 30, h0: 0, h1: 64, exitBoost: 6.5, mountSpeed: 7,
     color: T.colors.neon,
   }));
-  // BOOTH RAMP — shorter center ramp lifting ball briefly over the booths
-  T.ramps.push(makeRamp({
-    id: 'booth_ramp',
-    path: [
-      { x: 260, y: 540 }, { x: 260, y: 460 }, { x: 230, y: 400 },
-      { x: 260, y: 340 }, { x: 300, y: 320 },
-    ],
-    width: 28, h0: 0, h1: 44, exitBoost: 6, mountSpeed: 6.5,
-    color: T.colors.neon2,
-  }));
 
-  /* ---- MID-TABLE MINI FLIPPERS (kickers below grill) ---- */
-  T.flippers.push(
-    makeFlipper({ side:'L', group:'mid', px:150, py:560, len:54, r:8,
-      rest: 0.45, active: 0.45 - 0.85, speed: 0.7 }),
-    makeFlipper({ side:'R', group:'mid', px:390, py:560, len:54, r:8,
-      rest: Math.PI - 0.45, active: Math.PI - 0.45 + 0.85, speed: 0.7 }),
-  );
-
-  /* ---- ROLLOVER LANES (top) - "ABC" lanes spell out specials of the day ---- */
+  /* ---- TOP ROLLOVER LANES (above the dining area — SOD = special) ---- */
   T.lanes.push(
-    { x: 175, y: 86, lit: false, label: 'S' },
-    { x: 270, y: 78, lit: false, label: 'O' },
-    { x: 365, y: 86, lit: false, label: 'D' },  // SOD = special of day
+    { x: 175, y: 90, lit: false, label: 'S' },
+    { x: 230, y: 80, lit: false, label: 'O' },
+    { x: 290, y: 80, lit: false, label: 'D' },
   );
-
-  /* ---- TIMED HOLE (just one — the back door) -------------------------- */
-  T.teleHoles = [
-    { id: 0, x: 75, y: 410, r: 14, label: 'BACK', open: false, timer: 0,
-      capturedBall: null, captureTimer: 0, holdFrames: 40, iris: 0 },
-  ];
 
   // game state
-  T.orderProgress = 0;     // ORDERs completed
-  T.tipsProgress = 0;
-  T.boothsServed = 0;
-  T.shotsTakenThisGame = 0;
+  T.orderProgress = 0;
+  T.gordonDowns = 0;
+  T.tipsCollected = 0;
+  T.ballSaverFrames = 0;     // active for first few seconds after launch
 
-  /* ---- TABLE-SYSTEMS DATA (consumed by the engine) -------------------- */
+  /* ---- TABLE-SYSTEMS DATA (engine consumes these) -------------------- */
   T.shotSequence = [
-    { id: 'kitchen_ramp', label: 'TO THE KITCHEN', matchType: 'ramp', matchId: 'kitchen_ramp' },
-    { id: 'booth_ramp',   label: 'TO BOOTH ROW',   matchType: 'ramp', matchId: 'booth_ramp' },
-    { id: 'lock',         label: 'INTO THE FRYER', matchType: 'lock', matchId: null },
-    { id: 'kitchen_ramp_2', label: 'BACK TO KITCHEN', matchType: 'ramp', matchId: 'kitchen_ramp' },
+    { id: 'to_kitchen',  label: 'TO THE KITCHEN', matchType:'ramp',  matchId:'kitchen_ramp' },
+    { id: 'flick_gordon',label: 'FLICK GORDON',   matchType:'target',matchId:'gordon' },
+    { id: 'serve_booth', label: 'SERVE A BOOTH',  matchType:'bumper',matchId:['booth_1','booth_2','booth_3'] },
+    { id: 'into_fryer',  label: 'INTO THE FRYER', matchType:'lock',  matchId:null },
   ];
-  T.shotReward = 4000;
-  T.shotCompleteBonus = 22000;
+  T.shotReward = 4500;
+  T.shotCompleteBonus = 25000;
 
   T.modeDefs = {
     grillFrenzy: {
@@ -1780,42 +1975,90 @@ function buildCosmicCluckers(tdef) {
   T.storyBeats = {
     gameStart:    'OPEN THE DINER',
     firstOrder:   'ORDER UP',
+    gordonHit:    'GORDON IS MAD',
+    gordonDown:   'GORDON QUITS',
     fryerLit:     'FRYER IS HOT',
-    bossVisit:    'GORDON DROPS IN',     // sitcom boss trope
-    catchPhrase:  'ZORPLAX SAYS HI',     // Bleeb's catchphrase
-    multiball:    'CUSTOMERS RUSH IN',
+    tipsFull:     'TIP JAR FULL',
+    bossVisit:    'CUSTOMERS LINE UP',
+    catchPhrase:  'ZORPLAX SAYS HI',
+    multiball:    'KITCHEN OVERRUN',
     extraBall:    'BLEEB WINKS',
     victory:      'EMPLOYEE OF MONTH',
   };
 
   T.extraBallScoreThresholds = [45000, 130000];
 
-  // Bank completion handler — sitcom plot beats fire here
+  /* ---- BANK COMPLETION (ORDER bank) --------------------------------- */
   T.onBankComplete = function(group, T) {
     if (group === 'order') {
       T.orderProgress++;
       addScore(3500 * _pb.mult);
       dmdPlay(animOrderUp());
-      // first ORDER bank completed = first plot beat
+      addTips(T, 20);
       if (T.orderProgress === 1) storyBeat('firstOrder', T);
-      // every 3rd ORDER = boss-visit gag
-      if (T.orderProgress % 3 === 0) storyBeatRepeatable('bossVisit', T);
-      // light the fryer for multiball when 2 ORDERs done
+      if (T.orderProgress % 2 === 0) storyBeatRepeatable('bossVisit', T);
       if (T.orderProgress >= 2 && !T.multiballArmed) {
         T.multiballArmed = true;
         storyBeat('fryerLit', T);
       }
-    } else if (group === 'tips') {
-      T.tipsProgress++;
-      addScore(5000 * _pb.mult);
-      dmdFlash('TIPS COMPLETE', '+' + (5000 * _pb.mult));
-      // tips bank fires Bleeb's catchphrase every 2 completions
-      if (T.tipsProgress % 2 === 0) storyBeatRepeatable('catchPhrase', T);
     }
+  };
+
+  /* ---- MULTI-HIT TARGET (Gordon) HANDLERS --------------------------- */
+  T.onMultiHit = function(t, T) {
+    addTips(T, 10);
+    dmdFlash('GORDON MAD', 'HP ' + t.hp + '/' + t.maxHp);
+    storyBeatRepeatable('gordonHit', T);
+  };
+  T.onMultiHitDown = function(t, T) {
+    T.gordonDowns++;
+    addTips(T, 30);
+    storyBeat('gordonDown', T);
+    dmdPlay(animGordonDown());
+    snd('gordonQuits');
+  };
+  T.onMultiHitReturn = function(t, T) {
+    dmdFlash('GORDON RETURNS');
+  };
+
+  /* ---- LANES COMPLETE handler --------------------------------------- */
+  T.onLanesComplete = function(T) {
+    dmdFlash('SPECIAL OF DAY', 'MULTIPLIER UP');
+    addTips(T, 15);
+    snd('group');
+  };
+
+  /* ---- BALL-SAVER hook (called from loseBall via T.onBallDrained) --- */
+  T.onBallDrained = function(T) {
+    // Random ball-saver: 30% chance to save during normal play
+    if (Math.random() < T.dishwasher.saveChance) {
+      T.dishwasher.saveFlash = 60;
+      dmdFlash('DISHWASHER SAVE', 'BALL REWASHED');
+      snd('dishwasher');
+      return true; // save the ball
+    }
+    return false;
   };
 
   return T;
 }
+
+/* helper: add to the Tip Jar and trigger jackpot when full */
+function addTips(T, amount) {
+  if (!T.tipJar) return;
+  T.tipJar.level = Math.min(100, T.tipJar.level + amount);
+  T.tipJar.flash = 24;
+  T.tipsCollected = (T.tipsCollected || 0) + amount;
+  if (T.tipJar.level >= 100) {
+    // JACKPOT!
+    addScore(25000 * _pb.mult);
+    dmdPlay(animTipJackpot());
+    storyBeatRepeatable('tipsFull', T);
+    snd('cashRegister');
+    T.tipJar.level = 0;
+  }
+}
+
 
 /* ==========================================================================
  * SECTION 10d — TABLE: SHOWER DEFENSE
@@ -2431,7 +2674,7 @@ const LANE_FEED_PATH = [
   { x: 312, y: 214 },   // clear of the channel — release here
 ];
 function stepLaneFeed(ball) {
-  const path = LANE_FEED_PATH;
+  const path = (_table && _table.laneFeedPath) || LANE_FEED_PATH;
   // advance a normalized parameter along the polyline
   ball.feedT += (ball.feedSpeed || 9) / 240;   // ~path-length normalization
   const segs = path.length - 1;
@@ -2548,12 +2791,33 @@ function respondCollision(ball, hit, T) {
     }
     case 'target': {
       const t = col.ref;
+      // multi-hit target (Gordon): drops in stages, doesn't go down permanently
+      if (t.multiHit) {
+        if (t.hp > 0) {
+          t.hp--; t.flash = 24;
+          addScore((t.value || 1500) * _pb.mult);
+          bumpCombo();
+          snd('target');
+          onShotEvent('target', t.group || 'any', T);
+          if (t.hp === 0) {
+            t.downTimer = 600;   // ~10s before he returns
+            addScore(15000 * _pb.mult);
+            if (T.onMultiHitDown) T.onMultiHitDown(t, T);
+          } else {
+            if (T.onMultiHit) T.onMultiHit(t, T);
+          }
+        } else {
+          snd('wall');           // already down — just a bounce
+        }
+        break;
+      }
       if (!t.hit) {
         t.hit = true;
         t.flash = 18;
         addScore(t.value * _pb.mult);
         bumpCombo();
         snd('target');
+        onShotEvent('target', t.group || 'any', T);
         onTargetHit(t, T);
       } else {
         // already-down target is STILL a solid wall — just a quieter bounce
@@ -3052,6 +3316,15 @@ function spawnBallInLane() {
 }
 
 function loseBall() {
+  // table-specific ball-saver — can absorb the drain and re-spawn the ball
+  if (_table && _table.onBallDrained && _table.onBallDrained(_table)) {
+    // ball saved — re-spawn after a short pause, don't decrement ball count
+    setTimeout(() => {
+      if (!_running) return;
+      spawnBallInLane();
+    }, 800);
+    return;
+  }
   _pb.combo = 0; _pb.mult = 1;
   if (_pb.ball >= _pb.ballsTotal) {
     endGame();
@@ -3177,7 +3450,16 @@ function tick(now) {
     const colliders = assembleColliders(_table);
     // bumper cooldown / flash decay
     for (const b of _table.bumpers) { if (b.cooldown > 0) b.cooldown--; if (b.flash > 0) b.flash--; }
-    for (const t of _table.targets) { if (t.flash > 0) t.flash--; }
+    for (const t of _table.targets) {
+      if (t.flash > 0) t.flash--;
+      if (t.multiHit && t.downTimer > 0) {
+        t.downTimer--;
+        if (t.downTimer === 0) {
+          t.hp = t.maxHp;
+          if (_table.onMultiHitReturn) _table.onMultiHitReturn(t, _table);
+        }
+      }
+    }
     for (const wh of _table.wormholes) { wh.swirl += 0.08; }
     // timed teleport holes open/close + capture
     if (_table.teleHoles) stepTeleHoles(_table);
@@ -3270,6 +3552,25 @@ function drawPlayfield() {
   }
   // ---- shower spray (Shower Defense) — drawn under ramps so ball is visible ----
   if (T.shower) drawShowerSpray(ctx, T);
+  // ---- kitchen mini-playfield tint (Barf's House) — subtle floor color
+  //      so the kitchen zone reads as a distinct room ----
+  if (T.id === 'barfs_house') {
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,179,48,0.07)';
+    ctx.fillRect(310, 26, 204, 254);   // kitchen interior
+    // tile grid hint
+    ctx.strokeStyle = 'rgba(255,179,48,0.10)';
+    ctx.lineWidth = 1;
+    for (let gx = 310; gx <= 514; gx += 34) {
+      ctx.beginPath(); ctx.moveTo(gx, 26); ctx.lineTo(gx, 280); ctx.stroke();
+    }
+    for (let gy = 60; gy <= 280; gy += 34) {
+      ctx.beginPath(); ctx.moveTo(310, gy); ctx.lineTo(514, gy); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // ---- general decor (tip jar, dishwasher, neon signs) ----
+  if (T.decor && T.decor.length) drawDecor(ctx, T);
 
   // ---- ramps: draw as elevated translucent channels (drawn first, under) ----
   for (const ramp of T.ramps) drawRamp(ctx, ramp);
@@ -3453,6 +3754,117 @@ function drawUpperDeckItem(ctx, u, T) {
   ctx.restore();
 }
 
+/* ==========================================================================
+ * BARF'S HOUSE — Tip Jar, Dishwasher, Kitchen decor
+ * ========================================================================== */
+function drawTipJar(ctx, jar, T) {
+  ctx.save();
+  const x = jar.x, y = jar.y, w = jar.w, h = jar.h;
+  // glass jar outline
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#cfe5ff';
+  ctx.shadowColor = '#cfe5ff'; ctx.shadowBlur = 8;
+  // rim
+  ctx.beginPath();
+  ctx.rect(x - 4, y - h/2 - 6, w + 8, 8);
+  ctx.stroke();
+  // body
+  ctx.beginPath();
+  ctx.rect(x, y - h/2, w, h);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  // fill — money stack
+  const fillH = (jar.level / 100) * (h - 6);
+  if (fillH > 0) {
+    ctx.fillStyle = T.colors.neon2 || '#6dd44a';
+    ctx.fillRect(x + 3, y + h/2 - fillH - 3, w - 6, fillH);
+    // $ signs in fill
+    ctx.fillStyle = '#1a5e1a';
+    ctx.font = 'bold 12px monospace'; ctx.textAlign = 'center';
+    const rows = Math.min(4, Math.floor(fillH / 14));
+    for (let i = 0; i < rows; i++) {
+      ctx.fillText('$', x + w/2, y + h/2 - 6 - i * 14);
+    }
+  }
+  // jar label
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('TIPS', x + w/2, y - h/2 - 9);
+  // flash glow if recently filled
+  if (jar.flash > 0) {
+    jar.flash--;
+    ctx.globalAlpha = jar.flash / 24;
+    ctx.fillStyle = T.colors.neon;
+    ctx.fillRect(x, y - h/2, w, h);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function drawDishwasher(ctx, dw, T) {
+  ctx.save();
+  const x = dw.x, y = dw.y, w = dw.w, h = dw.h;
+  // body
+  ctx.fillStyle = '#3a2a18';
+  ctx.fillRect(x - w/2, y - h/2, w, h);
+  ctx.strokeStyle = T.colors.wall || '#9b5a2c';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x - w/2, y - h/2, w, h);
+  // round window
+  ctx.beginPath();
+  ctx.arc(x, y, h/2 - 4, 0, TAU);
+  ctx.fillStyle = '#1a3040';
+  ctx.fill();
+  ctx.strokeStyle = '#9eb5c0'; ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // animated sloshing water inside the window
+  dw.spin = (dw.spin + 0.08) % TAU;
+  ctx.beginPath();
+  for (let a = 0; a < TAU; a += 0.2) {
+    const rr = (h/2 - 6) + Math.sin(a * 3 + dw.spin) * 2;
+    const px = x + Math.cos(a) * rr;
+    const py = y + Math.sin(a) * rr * 0.4;
+    if (a === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(120,180,255,0.4)';
+  ctx.fill();
+  // label
+  ctx.fillStyle = '#e5d5b5';
+  ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('DISHWASHER', x, y + h/2 + 12);
+  // save-flash effect
+  if (dw.saveFlash > 0) {
+    dw.saveFlash--;
+    ctx.globalAlpha = dw.saveFlash / 60;
+    ctx.fillStyle = T.colors.neon;
+    ctx.fillRect(x - w/2, y - h/2, w, h);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function drawDecor(ctx, T) {
+  if (!T.decor) return;
+  for (const d of T.decor) {
+    if (d.kind === 'tipjar' && d.ref) drawTipJar(ctx, d.ref, T);
+    else if (d.kind === 'dishwasher' && d.ref) drawDishwasher(ctx, d.ref, T);
+    else if (d.kind === 'sign') {
+      ctx.save();
+      const blink = ((_pb.tick >> 4) & 1) ? 1 : 0.55;
+      ctx.shadowColor = T.colors.neon; ctx.shadowBlur = 12 * blink;
+      ctx.strokeStyle = T.colors.neon; ctx.lineWidth = 2;
+      ctx.strokeRect(d.x - d.w/2, d.y - d.h/2, d.w, d.h);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = T.colors.neon; ctx.globalAlpha = blink;
+      ctx.font = 'bold 14px "Courier New", monospace'; ctx.textAlign = 'center';
+      ctx.fillText(d.text || '', d.x, d.y + 5);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+  }
+}
+
 function drawShowerSpray(ctx, T) {
   const sh = T.shower;
   if (!sh) return;
@@ -3624,7 +4036,40 @@ function drawBumper(ctx, b, T) {
 
 function drawTarget(ctx, t, T) {
   ctx.save();
-  const flash = t.flash / 18;
+  const flash = t.flash / 24;
+  // Gordon multi-hit target: render as a little manager figure with HP bar
+  if (t.isGordon) {
+    const down = t.hp === 0;
+    // body rectangle (his tie/suit)
+    ctx.fillStyle = down ? '#3a3a55' : (flash > 0 ? '#fff' : T.colors.decor || '#ff5a4c');
+    if (flash > 0) { ctx.shadowColor = '#fff'; ctx.shadowBlur = 16 * flash; }
+    ctx.fillRect(t.x - t.w/2, t.y - t.h/2, t.w, t.h);
+    ctx.shadowBlur = 0;
+    // head circle
+    ctx.beginPath();
+    ctx.arc(t.x, t.y - t.h/2 - 6, 5, 0, TAU);
+    ctx.fillStyle = down ? '#666' : '#ffdfb5';
+    ctx.fill();
+    // tie indicator (a vertical stripe)
+    if (!down) {
+      ctx.fillStyle = '#1a1a2a';
+      ctx.fillRect(t.x - 1, t.y - t.h/2 + 2, 2, t.h - 8);
+    }
+    // HP pips
+    for (let i = 0; i < (t.maxHp || 3); i++) {
+      ctx.beginPath();
+      ctx.arc(t.x - (t.maxHp - 1) * 4 + i * 8, t.y + t.h/2 + 8, 2.5, 0, TAU);
+      ctx.fillStyle = i < t.hp ? (T.colors.neon || '#ffb330') : '#444';
+      ctx.fill();
+    }
+    // GORDON label
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 8px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('GORDON', t.x, t.y + t.h/2 + 22);
+    ctx.restore();
+    return;
+  }
+  // standard drop target
   const col = t.hit ? '#3a3a55' : (flash > 0 ? '#fff' : T.colors.neon2);
   ctx.fillStyle = col;
   if (flash > 0) { ctx.shadowColor = '#fff'; ctx.shadowBlur = 14 * flash; }
@@ -3719,6 +4164,36 @@ function drawBall(ctx, ball, T) {
   ctx.ellipse(ball.x + shadowOff, ball.y + shadowOff, ball.r * 0.95, ball.r * 0.7, 0, 0, TAU);
   ctx.fillStyle = 'rgba(0,0,0,0.5)';
   ctx.fill();
+  // BARF'S HOUSE: render ball as a small white plate
+  if (T.id === 'barfs_house') {
+    // plate underside (rim ring)
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, r * 1.05, 0, TAU);
+    ctx.fillStyle = '#e0d4b8';
+    ctx.fill();
+    // plate top
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, r * 0.92, 0, TAU);
+    const pg = ctx.createRadialGradient(ball.x - r*0.3, ball.y - r*0.3, r*0.1,
+                                        ball.x, ball.y, r);
+    pg.addColorStop(0, '#ffffff');
+    pg.addColorStop(0.8, '#f6f0e0');
+    pg.addColorStop(1, '#d4c8a8');
+    ctx.fillStyle = pg;
+    ctx.fill();
+    // plate rim ring detail
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = '#9b8b6a';
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, r * 0.72, 0, TAU);
+    ctx.stroke();
+    // small specular
+    ctx.beginPath();
+    ctx.arc(ball.x - r * 0.3, ball.y - r * 0.3, r * 0.22, 0, TAU);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fill();
+    return;
+  }
   // ball body
   const g = ctx.createRadialGradient(
     ball.x - r * 0.35, ball.y - r * 0.35, r * 0.15,
@@ -3959,10 +4434,10 @@ function saveCredits(n) {
 function buildTable(id, tdef) {
   switch (id) {
     case 'worm_holer':     return buildWormHoler(tdef);
-    case 'cosmic_cluckers':return buildCosmicCluckers(tdef);
+    case 'barfs_house':    return buildBarfsHouse(tdef);
     case 'shower_defense': return buildShowerDefense(tdef);
-    // legacy id kept so old links still work
-    case 'barfs_house':    return buildCosmicCluckers(tdef);
+    // legacy alias
+    case 'cosmic_cluckers':return buildBarfsHouse(tdef);
     default:               return buildWormHoler(tdef);
   }
 }

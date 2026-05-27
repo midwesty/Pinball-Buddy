@@ -107,15 +107,15 @@
   // accent colors per table for the lobby cards
   const ACCENTS = {
     worm_holer:    { accent:'#ff3ea5', glow:'rgba(255,62,165,.5)' },
-    cosmic_cluckers:{ accent:'#ffb330', glow:'rgba(255,179,48,.5)' },
+    barfs_house:   { accent:'#ffb330', glow:'rgba(255,179,48,.5)' },
     shower_defense:{ accent:'#2ee8e8', glow:'rgba(46,232,232,.5)' },
-    barfs_house:   { accent:'#ffb330', glow:'rgba(255,179,48,.5)' }, // legacy alias
+    cosmic_cluckers:{ accent:'#ffb330', glow:'rgba(255,179,48,.5)' },
   };
   const DESCS = {
     worm_holer:'Open all four worm holes, chain quantum jumps, and lock a ball for Entanglement Multiball.',
-    cosmic_cluckers:"Run Bleeb's alien-chef chicken diner. ORDER targets, upper-deck booths, grill bumpers, FRYER multiball.",
+    barfs_house:"Bleeb's alien chicken diner. Kitchen mini-playfield with its own flipper, Gordon target, fill the Tip Jar, FRYER multiball.",
     shower_defense:'Defend your bathroom from BUGS and MOLD waves. Toggle the shower, fight the DRAIN BEAST.',
-    barfs_house:"Run Bleeb's alien-chef chicken diner. ORDER targets, upper-deck booths, grill bumpers, FRYER multiball.",
+    cosmic_cluckers:"Bleeb's alien chicken diner. Kitchen mini-playfield with its own flipper, Gordon target, fill the Tip Jar, FRYER multiball.",
   };
 
   async function build() {
@@ -128,7 +128,7 @@
       // fallback if JSON fails to load (e.g. file:// without server)
       tables = [
         { id:'worm_holer', name:'WORM HOLER', subtitle:'Quantum Pinball', status:'playable' },
-        { id:'cosmic_cluckers', name:'COSMIC CLUCKERS', subtitle:"Bleeb's Diner", status:'playable' },
+        { id:'barfs_house', name:"BARF'S HOUSE", subtitle:"Bleeb's Diner", status:'playable' },
         { id:'shower_defense', name:'SHOWER DEFENSE', subtitle:'Tower Defense Parody', status:'playable' },
       ];
     }
