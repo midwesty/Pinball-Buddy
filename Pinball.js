@@ -27,6 +27,26 @@
  *             space-stars theming. New DMD sprite primitives: dmdDinerSign,
  *             dmdFryer (with rising bubbles), dmdOpenClosedSign, dmdCashRegister,
  *             dmdChefHat. New sound cues: splash, crash.
+ * v0.009    — SHOWER DEFENSE unique-geometry rewrite. Cabinet built from scratch:
+ *             RIGHT plunger lane themed as toilet-flush plumbing pipes,
+ *             shower stall mini-playfield walled off top-left with its own
+ *             upper flipper + soap-bar bumper, togglable shower curtain that
+ *             seals the stall entry, WET rollover lanes toggle the shower
+ *             (auto-times-out after 6s), BUGS + MOLD vertical drop banks
+ *             (wave progression: BUGS->MOLD->DRAIN BEAST multiball), MOLD
+ *             MONSTER multi-hit boss target on the right wall, asymmetric
+ *             HOT+COLD faucet bumpers, TOILET lock zone bottom-right with
+ *             25% flush-save ball-saver chance, TP ROLL signature toy that
+ *             unspools as you score (full unspool = 25k jackpot), DRAIN BEAST
+ *             themed drain decor, ball renders as a soapy WATER DROPLET on
+ *             this table. New DMD sprites: dmdShowerHead, dmdWaterSpray,
+ *             dmdToilet, dmdFlushSwirl, dmdMoldMonster, dmdTPRoll,
+ *             animDripFaucet. New table-specific animations: animGameStartShower,
+ *             animGameOverShower, animBallLockShower, animMultiballShower,
+ *             animMoldMonsterDown, animTPJackpot, animFlushSave, plus
+ *             attractTitleShower, attractTaglineShower, attractPressLaunchShower
+ *             ('TOP DEFENDERS' scores header). New sounds: flush, drip.
+ *             Stress: 178/200 drained, 0 stuck, 0 escapes, 0 NaN.
  *
  * Single-file ES module. Exports openPinball().
  *
@@ -108,7 +128,7 @@ const PB = {
 // playfield bounding walls (used by every table)
 const WALL = { L: 26, R: 514, T: 26, DRAIN_Y: 944 };
 
-export const PB_VERSION = 'v0.008.1';
+export const PB_VERSION = 'v0.009';
 
 /* ==========================================================================
  * SECTION 3 — COLLIDER PRIMITIVES
@@ -428,6 +448,8 @@ function snd(name) {
     case 'moldSplat':       noise(0.25, 0.15, 400); break;
     case 'showerOn':        noise(0.6, 0.16, 1800); tone(440,0.4,'sine',0.10,880); break;
     case 'shower':          noise(0.25, 0.14, 2200); break;
+    case 'flush':           noise(0.7, 0.25, 1500); [220,180,140,110].forEach((f,i)=>setTimeout(()=>tone(f,0.18,'sawtooth',0.14,f*0.6),i*60)); break;
+    case 'drip':            tone(880, 0.06, 'sine', 0.12); setTimeout(()=>tone(660,0.05,'sine',0.10),120); break;
     case 'drainBeast':      tone(60, 0.5, 'sawtooth', 0.20, 30); noise(0.5, 0.14, 200); break;
     case 'beastRoar':       tone(80, 0.8, 'sawtooth', 0.22, 40); noise(0.8, 0.16, 300); break;
     default: break;
@@ -657,6 +679,7 @@ function dmdStars(grid, t, seed = 1) {
 // ---- EVENT ANIMATIONS (each ~180 frames / 3s) --------------------------
 function animGameStart(table) {
   if (table && table.id === 'barfs_house') return animGameStartBarfs(table);
+  if (table && table.id === 'shower_defense') return animGameStartShower(table);
   // default: Worm Holer / generic
   return {
     dur: 150, sound: 'gameStart',
@@ -708,6 +731,7 @@ function animGameStartBarfs(table) {
 
 function animGameOver(table, score, isHigh) {
   if (table && table.id === 'barfs_house') return animGameOverBarfs(table, score, isHigh);
+  if (table && table.id === 'shower_defense') return animGameOverShower(table, score, isHigh);
   return {
     dur: 200, sound: 'gameover',
     render(grid, p, t) {
@@ -751,6 +775,7 @@ function animGameOverBarfs(table, score, isHigh) {
 
 function animBallLock(table) {
   if (table && table.id === 'barfs_house') return animBallLockBarfs(table);
+  if (table && table.id === 'shower_defense') return animBallLockShower(table);
   return {
     dur: 165, sound: 'lock',
     cues: [{ at: 60, snd: 'clunk' }],
@@ -795,6 +820,7 @@ function animBallLockBarfs(table) {
 
 function animMultiball(table) {
   if (table && table.id === 'barfs_house') return animMultiballBarfs(table);
+  if (table && table.id === 'shower_defense') return animMultiballShower(table);
   return {
     dur: 200, sound: 'multiball',
     cues: [{ at: 40, snd: 'whoosh' }, { at: 110, snd: 'pop' }],
@@ -842,6 +868,118 @@ function animMultiballBarfs(table) {
     },
   };
 }
+
+// SHOWER DEFENSE — shower turns on, water spray pulses, "BALL 1" appears
+function animGameStartShower(table) {
+  return {
+    dur: 180, sound: 'showerOn',
+    cues: [{ at: 40, snd: 'showerOn' }, { at: 110, snd: 'gameStart' }],
+    render(grid, p, t) {
+      // showerhead at top-left
+      dmdShowerHead(grid, 16, 5);
+      // water spray grows as p increases
+      const len = Math.floor(p * 18);
+      dmdWaterSpray(grid, 16, 5, t, len);
+      // title slides in
+      if (p > 0.45) {
+        const name = "SHOWER DEFENSE";
+        const w = dmdTextWidth(name);
+        const slide = Math.round((1 - Math.min(1, (p - 0.45) * 3)) * 50);
+        dmdText(grid, name, Math.floor((DMD.cols - w) / 2) + slide, 10, 1);
+      }
+      // BALL 1
+      if (p > 0.75) {
+        dmdTextCentered(grid, 'BALL 1 - DEFEND', 22, ((t >> 3) & 1));
+      }
+    },
+  };
+}
+
+// SHOWER DEFENSE — shower drips off + drain swirls, score displays
+function animGameOverShower(table, score, isHigh) {
+  return {
+    dur: 210, sound: 'gameover',
+    cues: [{ at: 30, snd: 'drip' }, { at: 90, snd: 'drip' }],
+    render(grid, p, t) {
+      // showerhead drips slowly
+      dmdShowerHead(grid, 18, 5);
+      // a single drip falls
+      const dripY = Math.floor(8 + ((t * 0.4) % 14));
+      dmdDot(grid, 18, dripY, 1);
+      // drain swirl bottom-right
+      dmdFlushSwirl(grid, DMD.cols - 18, 14, t);
+      // mold creep on the walls
+      if (p > 0.3) {
+        for (let i = 0; i < 4; i++) {
+          dmdMoldSplat(grid, 30 + i * 16, 22, 2);
+        }
+      }
+      dmdTextCentered(grid, 'GAME OVER', 4, p > 0.35 ? 1 : 0);
+      if (p > 0.55) {
+        dmdTextCentered(grid, shortNum(score), 12, 1);
+      }
+      if (p > 0.7 && isHigh) {
+        dmdTextCentered(grid, 'CLEAN SWEEP', 19, ((t >> 3) & 1));
+      }
+    },
+  };
+}
+
+// SHOWER DEFENSE — ball spirals into toilet bowl with flush swirl
+function animBallLockShower(table) {
+  return {
+    dur: 170, sound: 'flush',
+    cues: [{ at: 40, snd: 'flush' }, { at: 110, snd: 'whoosh' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2;
+      // toilet at bottom
+      dmdToilet(grid, cx, 18);
+      // ball spirals in
+      if (p < 0.7) {
+        const a = t * 0.35;
+        const r = (1 - p / 0.7) * 7;
+        const bx = cx + Math.cos(a) * r;
+        const by = 14 + Math.sin(a) * r * 0.5;
+        dmdBall(grid, bx, by, 2);
+      }
+      // swirl
+      dmdFlushSwirl(grid, cx, 14, t);
+      dmdTextCentered(grid, 'TOILET LOCKED', 24, ((t >> 3) & 1));
+    },
+  };
+}
+
+// SHOWER DEFENSE — bug swarm explodes outward across the bathroom
+function animMultiballShower(table) {
+  return {
+    dur: 220, sound: 'multiball',
+    cues: [{ at: 20, snd: 'bugSquish' }, { at: 100, snd: 'drainBeast' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2, cy = 12;
+      // drain beast eye in center
+      const eyeW = 4 + Math.round(p * 4);
+      dmdCircle(grid, cx, cy, eyeW, 1, false);
+      dmdCircle(grid, cx, cy, Math.max(1, eyeW - 2), 1, true);
+      // bugs scatter radially
+      const n = 8;
+      for (let i = 0; i < n; i++) {
+        const ang = i * (TAU / n) + t * 0.05;
+        const rr = p * 36;
+        const bx = cx + Math.cos(ang) * rr;
+        const by = cy + Math.sin(ang) * rr * 0.5;
+        dmdBug(grid, bx | 0, by | 0);
+      }
+      // mold splats along the bottom
+      for (let i = 0; i < 5; i++) {
+        if (p * 5 > i) {
+          dmdMoldSplat(grid, 14 + i * 22, 22, 2);
+        }
+      }
+      dmdTextCentered(grid, 'EVERY DRAIN ALIVE', 4, (t >> 2) & 1);
+    },
+  };
+}
+
 function animBlackHole() {
   return {
     dur: 180, sound: 'blackhole',
@@ -1254,6 +1392,177 @@ function animDrainBeast() {
   };
 }
 
+// ---- SHOWER DEFENSE: extra sprite helpers ---------------------------------
+// Showerhead disc with attached pipe
+function dmdShowerHead(grid, cx, cy) {
+  dmdLine(grid, cx, cy - 4, cx, cy - 1, 1);          // pipe
+  dmdRect(grid, cx - 5, cy, 11, 3, 1);               // head disc
+  // nozzle dots
+  for (let i = -4; i <= 4; i += 2) dmdDot(grid, cx + i, cy + 3, 1);
+}
+// Water droplets falling from a head
+function dmdWaterSpray(grid, cx, cy, t, len) {
+  for (let i = -5; i <= 5; i++) {
+    const x = cx + i * 2;
+    const ymax = Math.min(len || 18, len || 18);
+    for (let y = cy + 1; y < cy + 1 + ymax; y += 2) {
+      if (((y + t + i) % 4) > 0) dmdDot(grid, x | 0, y | 0, 1);
+    }
+  }
+}
+// Toilet bowl (oval seat + tank silhouette)
+function dmdToilet(grid, cx, cy) {
+  // tank
+  dmdBox(grid, cx - 4, cy - 7, 9, 5, 1);
+  // bowl (oval)
+  for (let dx = -6; dx <= 6; dx++) {
+    const dy = Math.round(Math.sqrt(Math.max(0, 1 - (dx * dx) / 36)) * 3);
+    dmdDot(grid, cx + dx, cy - dy + 2, 1);
+    dmdDot(grid, cx + dx, cy + dy + 2, 1);
+  }
+}
+// Swirling flush (concentric arcs rotating around a point)
+function dmdFlushSwirl(grid, cx, cy, t) {
+  for (let i = 0; i < 3; i++) {
+    const r = 3 + i * 2;
+    const startA = t * 0.2 + i * 1.2;
+    for (let a = 0; a < TAU * 0.7; a += 0.25) {
+      const x = cx + Math.cos(startA + a) * r;
+      const y = cy + Math.sin(startA + a) * r * 0.5;
+      dmdDot(grid, x | 0, y | 0, 1);
+    }
+  }
+}
+// Mold monster — blobby creature with eyes
+function dmdMoldMonster(grid, cx, cy, t, alive) {
+  if (!alive) {
+    // collapsed into a puddle
+    for (let dx = -7; dx <= 7; dx++) {
+      const dy = Math.round(Math.sqrt(Math.max(0, 1 - (dx * dx) / 49)));
+      dmdDot(grid, cx + dx, cy + dy, 1);
+      dmdDot(grid, cx + dx, cy - dy, 1);
+    }
+    return;
+  }
+  // wiggling blob body
+  const wig = Math.sin(t * 0.18) * 2;
+  for (let dx = -5; dx <= 5; dx++) {
+    const dy = Math.round(Math.sqrt(Math.max(0, 1 - (dx * dx) / 25)) * 4);
+    dmdDot(grid, cx + dx, cy - dy + (dx & 1 ? wig : 0), 1);
+    dmdDot(grid, cx + dx, cy + dy + (dx & 1 ? wig : 0), 1);
+  }
+  // eyes
+  dmdDot(grid, cx - 2, cy - 1, 1);
+  dmdDot(grid, cx + 2, cy - 1, 1);
+  // tendrils on top (mold growth)
+  if ((t >> 3) & 1) {
+    dmdDot(grid, cx - 3, cy - 6, 1);
+    dmdDot(grid, cx + 3, cy - 6, 1);
+    dmdDot(grid, cx, cy - 7, 1);
+  }
+}
+// TP roll (cylinder side-view) with optional unspooled paper trail
+function dmdTPRoll(grid, cx, cy, unspooled) {
+  // roll body
+  dmdBox(grid, cx - 5, cy - 5, 11, 10, 1);
+  // center hole
+  dmdRect(grid, cx - 1, cy - 1, 3, 3, 0);
+  dmdCircle(grid, cx, cy, 2, 1, false);
+  // paper trail unspooling down
+  const trailLen = Math.floor(unspooled / 8);
+  for (let i = 0; i < trailLen; i++) {
+    const y = cy + 6 + i;
+    if (y >= DMD.rows - 1) break;
+    dmdDot(grid, cx - 4, y, 1);
+    dmdDot(grid, cx + 4, y, 1);
+    if ((i % 3) === 0) {
+      for (let dx = -3; dx <= 3; dx++) dmdDot(grid, cx + dx, y, 1);
+    }
+  }
+}
+
+function animDripFaucet(grid, cx, cy, t) {
+  dmdBox(grid, cx - 2, cy - 4, 5, 4, 1);    // faucet
+  // drip
+  const phase = t % 30;
+  if (phase < 20) dmdDot(grid, cx, cy + phase / 3, 1);
+}
+
+// ---- SHOWER DEFENSE new animations ---------------------------------------
+function animMoldMonsterDown() {
+  return {
+    dur: 170, sound: 'moldSplat',
+    cues: [{ at: 30, snd: 'whoosh' }, { at: 90, snd: 'splash' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2;
+      // monster sags as p increases
+      const cy = 11 + Math.floor(p * 8);
+      const alive = p < 0.55;
+      dmdMoldMonster(grid, cx, cy, t, alive);
+      // splat marks when collapsed
+      if (!alive) {
+        for (let i = 0; i < 6; i++) {
+          const ang = (i * TAU / 6) + t * 0.05;
+          const rr = (1 - p) * 6 + 6;
+          dmdDot(grid, (cx + Math.cos(ang) * rr) | 0, (cy + 4 + Math.sin(ang) * rr * 0.3) | 0, 1);
+        }
+      }
+      dmdTextCentered(grid, 'MOLD MONSTER DEAD', 24, ((t >> 3) & 1));
+    },
+  };
+}
+
+function animTPJackpot() {
+  return {
+    dur: 170, sound: 'cashRegister',
+    cues: [{ at: 30, snd: 'pop' }, { at: 80, snd: 'pop' }],
+    render(grid, p, t) {
+      dmdTextCentered(grid, 'TP JACKPOT', 4, 1);
+      // TP roll center, paper streams out
+      const cx = DMD.cols / 2;
+      dmdTPRoll(grid, cx, 12, 100);
+      // streamers fly outward
+      for (let i = 0; i < 6; i++) {
+        const ang = (i * TAU / 6) + t * 0.04;
+        const rr = p * 28;
+        const x = cx + Math.cos(ang) * rr;
+        const y = 12 + Math.sin(ang) * rr * 0.45;
+        for (let j = 0; j < 4; j++) {
+          const sx = cx + Math.cos(ang) * (rr * 0.4 + j * 2);
+          const sy = 12 + Math.sin(ang) * (rr * 0.4 + j * 2) * 0.45;
+          dmdDot(grid, sx | 0, sy | 0, 1);
+        }
+      }
+      dmdTextCentered(grid, '+25000', 23, ((t >> 3) & 1));
+    },
+  };
+}
+
+function animFlushSave() {
+  return {
+    dur: 140, sound: 'flush',
+    cues: [{ at: 30, snd: 'whoosh' }],
+    render(grid, p, t) {
+      const cx = DMD.cols / 2;
+      // toilet at bottom
+      dmdToilet(grid, cx, 17);
+      // swirl above the bowl
+      dmdFlushSwirl(grid, cx, 14, t);
+      // ball gets caught + sent back up
+      if (p < 0.5) {
+        // ball spirals down
+        const a = t * 0.3;
+        const r = (1 - p * 2) * 5;
+        dmdBall(grid, cx + Math.cos(a) * r, 12 - p * 4, 2);
+      } else {
+        // ball ejected back up
+        dmdBall(grid, cx, 18 - (p - 0.5) * 30, 2);
+      }
+      dmdTextCentered(grid, 'FLUSH SAVE', 3, ((t >> 3) & 1));
+    },
+  };
+}
+
 // ---- INITIALS ENTRY -----------------------------------------------------
 const INITIALS_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.<';  // < = back/end
 function animInitialsEntry() {
@@ -1318,6 +1627,7 @@ function animAttractReel(table) {
 }
 function attractTitle(grid, p, t, table) {
   if (table && table.id === 'barfs_house') return attractTitleBarfs(grid, p, t, table);
+  if (table && table.id === 'shower_defense') return attractTitleShower(grid, p, t, table);
   dmdStars(grid, t, 2);
   dmdBlackHole(grid, DMD.cols / 2, 11, t * 1.5, 1);
   const name = table.name.toUpperCase().substring(0, 16);
@@ -1351,6 +1661,7 @@ function attractTitleBarfs(grid, p, t, table) {
 
 function attractTagline(grid, p, t, table) {
   if (table && table.id === 'barfs_house') return attractTaglineBarfs(grid, p, t, table);
+  if (table && table.id === 'shower_defense') return attractTaglineShower(grid, p, t, table);
   dmdStars(grid, t, 4);
   const sub = (table.subtitle || 'QUANTUM PINBALL').toUpperCase();
   // typewriter reveal
@@ -1374,7 +1685,9 @@ function attractTaglineBarfs(grid, p, t, table) {
 }
 
 function attractScores(grid, p, t, table) {
-  const header = (table && table.id === 'barfs_house') ? 'TOP TIPPERS' : 'BEST PHYSICISTS';
+  let header = 'BEST PHYSICISTS';
+  if (table && table.id === 'barfs_house') header = 'TOP TIPPERS';
+  else if (table && table.id === 'shower_defense') header = 'TOP DEFENDERS';
   dmdTextCentered(grid, header, 2, 1);
   const tbl = loadHighTable(table.id);
   // show 5 rows, slow vertical scroll through them
@@ -1397,6 +1710,7 @@ function attractHowTo(grid, p, t) {
 }
 function attractPressLaunch(grid, p, t, table) {
   if (table && table.id === 'barfs_house') return attractPressLaunchBarfs(grid, p, t, table);
+  if (table && table.id === 'shower_defense') return attractPressLaunchShower(grid, p, t, table);
   dmdStars(grid, t, 6);
   dmdTextCentered(grid, (table ? table.name.toUpperCase() : 'PINBALL').substring(0, 16), 4, 1);
   dmdBox(grid, 22, 12, DMD.cols - 44, 11, 1);
@@ -1413,6 +1727,49 @@ function attractPressLaunchBarfs(grid, p, t, table) {
   dmdBox(grid, 30, 4, DMD.cols - 60, 8, 1);
   dmdTextCentered(grid, "BARF'S HOUSE", 7, 1);
   dmdTextCentered(grid, 'PRESS LAUNCH', 21, (t >> 3) & 1);
+}
+
+// SHOWER DEFENSE — showerhead spraying, title letters drop in like rain
+function attractTitleShower(grid, p, t, table) {
+  // showerhead at top-center
+  dmdShowerHead(grid, DMD.cols / 2, 4);
+  // long water spray fills the screen
+  dmdWaterSpray(grid, DMD.cols / 2, 4, t, 18);
+  // bug crawling at the bottom
+  const bugX = (t * 0.3) % DMD.cols;
+  dmdBug(grid, bugX | 0, 22);
+  // name letters drop one at a time from the top
+  const name = "SHOWER DEFENSE";
+  const w = dmdTextWidth(name);
+  const sx = Math.floor((DMD.cols - w) / 2);
+  const shown = Math.min(name.length, Math.floor(p * name.length * 1.6));
+  for (let i = 0; i < shown; i++) dmdText(grid, name[i], sx + i * 6, 14, 1);
+}
+// SHOWER DEFENSE — tagline reveal with dripping faucet
+function attractTaglineShower(grid, p, t, table) {
+  // dripping faucet on left
+  animDripFaucet(grid, 14, 8, t);
+  // mold splats spreading on right
+  for (let i = 0; i < 4; i++) {
+    if ((t + i * 10) % 80 < 60) dmdMoldSplat(grid, DMD.cols - 10 - i * 8, 6 + i * 2, 2);
+  }
+  // tagline typewriter
+  const sub = "DEFEND THE BATH";
+  const shown = Math.min(sub.length, Math.floor(p * sub.length * 1.5));
+  dmdTextCentered(grid, sub.substring(0, shown), 14, 1);
+  if (p > 0.6) dmdTextCentered(grid, 'BUGS - MOLD - BEAST', 22, (t >> 3) & 1);
+}
+// SHOWER DEFENSE — toilet + showerhead + flush prompt
+function attractPressLaunchShower(grid, p, t, table) {
+  // showerhead on left
+  dmdShowerHead(grid, 14, 5);
+  dmdWaterSpray(grid, 14, 5, t, 10);
+  // toilet on right
+  dmdToilet(grid, DMD.cols - 14, 14);
+  // title box in middle
+  dmdBox(grid, 30, 4, DMD.cols - 60, 8, 1);
+  dmdTextCentered(grid, "SHOWER DEFENSE", 7, 1);
+  dmdTextCentered(grid, 'FLUSH TO START', 21, (t >> 3) & 1);
 }
 
 /* ==========================================================================
@@ -2062,8 +2419,9 @@ function buildBarfsHouse(tdef) {
 
   /* ---- PLUNGER (on the LEFT — back-alley delivery) -------------------- */
   T.plunger = {
-    x: 46, top: 200, bottom: 944, headRest: 920, headDeep: 940,
-    headY: 920,
+    x: 46, top: 200, bottom: 944,
+    laneL: 26, laneR: 70,
+    headY: 920, headRest: 920, headDeep: 940,
   };
 
   /* ---- KITCHEN MINI-PLAYFIELD WALLS (top-right interior) -------------- */
@@ -2316,126 +2674,250 @@ function addTips(T, amount) {
 /* ==========================================================================
  * SECTION 10d — TABLE: SHOWER DEFENSE
  * --------------------------------------------------------------------------
- * Theme: tower-defense parody set in a bathroom. The player defends against
- * waves of bugs and mold using bathroom-fixture pinball elements. The
- * SHOWER toggle is the table's signature mechanic: when ON, a water curtain
- * activates a one-way deflector at the top that redirects the ball into a
- * scoring funnel; when OFF, the same path is wide open but no shower bonus.
+ * Tower-defense parody set in a bathroom. UNIQUE layout (not a re-skin):
  *
- * Unique mechanics:
- *   - SHOWER TOGGLE: rollover lit shower lanes flip the shower on/off.
- *     ON = water-curtain segment is active in physics, deflecting the ball.
- *   - BUGS bank (4) and MOLD bank (4) - sequential waves. Defeat BUGS to
- *     trigger MOLD, defeat MOLD to spawn the DRAIN BEAST (lock).
- *   - SINK FAUCETS as bumpers (HOT + COLD, 2 instead of 3).
- *   - The TOILET drain is the multiball lock zone.
+ *   - The PLAYFIELD IS THE BATHROOM. Asymmetric room arrangement.
+ *   - SHOWER STALL is a walled mini-playfield in the top-left with its own
+ *     upper flipper (left button), soap-bar bumper inside, and a one-way
+ *     ENTRY/EXIT gap at the bottom-right of the stall.
+ *   - SHOWER CURTAIN is a togglable collider sealing the stall entry.
+ *     When the shower is ON, the curtain blocks ball travel both ways:
+ *     ball OUTSIDE can't enter, ball INSIDE is trapped. Auto-times-out.
+ *   - WET rollover lanes (3) at top of dining floor toggle the shower
+ *     each time all three are lit.
+ *   - BATHTUB decor across the upper-mid wall, with the BUGS bank as
+ *     bug-shaped drop targets along it.
+ *   - SINK basin mid-right with HOT (red) + COLD (blue) faucet bumpers.
+ *   - MOLD bank on the left wall — sequential wave after BUGS.
+ *   - MOLD MONSTER multi-hit boss target growing on the right wall.
+ *   - TOILET lock zone bottom-right with "flush save" ball-saver chance.
+ *   - DRAIN BEAST visual under the flippers (themed drain).
+ *   - TP ROLL signature toy center-top — paper unspools as you score;
+ *     full unspool = JACKPOT.
+ *   - Plunger lane themed as TOILET FLUSH pipes (visual only — proven
+ *     right-side launch physics).
+ *   - The ball renders as a soapy WATER DROPLET on this table.
+ *
+ * Wave structure preserved: BUGS → MOLD → DRAIN BEAST multiball.
+ * Mold Monster is independent of the wave — available throughout.
  * ========================================================================== */
 function buildShowerDefense(tdef) {
-  const T = makeBaseTable('shower_defense', tdef, {
-    name: 'SHOWER DEFENSE',
-    subtitle: 'Tower Defense Parody',
-    colors: { bg:'#031820', mid:'#0a3848', neon:'#2ee8e8', neon2:'#7ec8ff',
-              wall:'#3f7f8a', decor:'#a8e8e8' },
+  const T = {
+    id: 'shower_defense',
+    name: tdef?.name || 'SHOWER DEFENSE',
+    subtitle: tdef?.subtitle || 'Bathroom Tower Defense',
+    colors: tdef?.colors || { bg:'#031820', mid:'#0a3848', neon:'#2ee8e8',
+                              neon2:'#7ec8ff', wall:'#3f7f8a', decor:'#a8e8e8' },
+    staticColliders: [], flippers: [], bumpers: [], targets: [],
+    ramps: [], wormholes: [], posts: [], lanes: [], spinners: [],
+    lockZone: null, teleHoles: null, upperDeck: [], decor: [],
+    activeHoles: 0, multiballArmed: false, locked: 0,
+  };
+
+  /* ---- OUTER CABINET (standard rect with angled corners) -------------- */
+  T.staticColliders.push(
+    // top wall (handoff to hood at x=360)
+    seg(60, 26, 360, 26, { r:4, role:'wall', color:T.colors.wall }),
+    // angled corners
+    seg(26, 60, 60, 26,  { r:4, role:'wall', color:T.colors.wall }),
+    // left wall (full height — no plunger this side)
+    seg(26, 60, 26, 760, { r:4, role:'wall', color:T.colors.wall }),
+    seg(26, 760, 70, 870,{ r:4, role:'wall', color:T.colors.wall }),
+    // right wall — full from cabinet top to plunger bottom
+    seg(514, 56, 514, 900, { r:4, role:'wall', color:T.colors.wall }),
+    // plunger lane inner wall + bottom
+    seg(470, 210, 470, 900, { r:4, role:'wall', color:T.colors.wall }),
+    seg(470, 900, 514, 900, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // Right-side top deflector — uses Worm Holer's proven hood geometry
+  // (themed visually as plumbing pipes via the renderer)
+  T.staticColliders.push(
+    // OUTER hood: top wall → shoulder → outer crest
+    seg(360, 26, 440, 46,   { r:5, role:'wall', color:T.colors.wall }),
+    seg(440, 46, 488, 120,  { r:5, role:'wall', color:T.colors.wall }),
+    // INNER hood closeoff (crest curving back inward to lane mouth)
+    seg(488, 120, 470, 196, { r:5, role:'wall', color:T.colors.wall }),
+    // Hood underside — long down-left ramp that carries the ball into play
+    seg(470, 196, 372, 250, { r:5, role:'wall', color:T.colors.wall }),
+    // Kicker lip at the mouth: noses the rising ball left onto the underside
+    seg(514, 206, 476, 180, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // right outlane drain channel (narrow, punishing)
+  T.staticColliders.push(
+    seg(514, 760, 470, 850, { r:4, role:'wall', color:T.colors.wall }),
+  );
+  // one-way gate at lane mouth (inactive initially, activates after launch)
+  T.laneGate = seg(470, 218, 514, 202, { r:3, role:'gate', color:T.colors.wall, active:false });
+
+  /* ---- LANE FEED PATH (right side, similar to Worm Holer) -------------- */
+  T.laneFeedPath = [
+    { x: 494, y: 206 },
+    { x: 492, y: 150 },
+    { x: 470, y: 96  },
+    { x: 430, y: 74  },
+    { x: 372, y: 96  },
+    { x: 332, y: 150 },
+    { x: 312, y: 220 },
+  ];
+
+  /* ---- PLUNGER (right side, themed as TOILET FLUSH pipes) ------------- */
+  T.plunger = {
+    x: 494, top: 210, bottom: 900,
+    laneL: 470, laneR: 514,
+    headY: 880, headRest: 880, headDeep: 920,
+  };
+
+  /* ---- SHOWER STALL (top-left mini-playfield walls) ------------------- */
+  // Right interior wall of the stall (separates stall from dining floor)
+  T.staticColliders.push(
+    // Right wall of the stall — from cabinet top down to the entry gap
+    seg(220, 60, 220, 240, { r:4, role:'shower-wall', color:T.colors.decor }),
+    // Bottom wall — solid section LEFT of the entry gap
+    seg(60, 280, 200, 280, { r:4, role:'shower-wall', color:T.colors.decor }),
+    // Bevel at the bottom-left corner so a slow ball can't dead-pocket
+    // against the 90° join with the left cabinet wall.
+    seg(26, 260, 60, 280, { r:4, role:'shower-wall', color:T.colors.decor }),
+    // The entry/exit gap is between (200, 280) and (220, 240) — diagonal opening
+    // Lip at the bottom-right of the stall guiding ball through
+    seg(200, 280, 220, 240, { r:4, role:'shower-wall', color:T.colors.decor }),
+  );
+  // SHOWER CURTAIN — togglable collider sealing the stall entry
+  T.showerCurtain = seg(220, 240, 200, 280,
+    { r:5, role:'wall', color:T.colors.neon, active: false });
+  T.staticColliders.push(T.showerCurtain);
+
+  /* ---- SHOWER (state + animation) ------------------------------------- */
+  T.shower = {
+    on: false,
+    spray: 0,
+    headX: 70, headY: 80,     // showerhead in stall top-left corner
+    curtainY: 260,             // animation reference
+    duration: 0,               // counts down while shower is on
+  };
+
+  /* ---- MAIN FLIPPERS (standard bottom) -------------------------------- */
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'main', px:176, py:812, len:84, r:9,
+      rest: 0.50, active: 0.50 - 0.95, speed: 0.62 }),
+    makeFlipper({ side:'R', group:'main', px:364, py:812, len:84, r:9,
+      rest: Math.PI - 0.50, active: Math.PI - 0.50 + 0.95, speed: 0.62 }),
+  );
+
+  /* ---- UPPER FLIPPER inside the shower stall (left button) ----------- */
+  // Catches falling balls in the stall and flicks them up at the bugs/sink
+  T.flippers.push(
+    makeFlipper({ side:'L', group:'shower', px:70, py:250, len:46, r:8,
+      rest: 0.45, active: 0.45 - 0.85, speed: 0.72 }),
+  );
+
+  /* ---- SLINGSHOTS (different angles than other tables — wet/slippery) */
+  // LEFT sling shallower; RIGHT sling steeper
+  T.staticColliders.push(
+    seg(95, 720, 158, 800, { r:6, role:'sling', bounce:1.45, color:T.colors.neon }),
+    seg(440, 690, 388, 798, { r:6, role:'sling', bounce:1.55, color:T.colors.neon }),
+  );
+  T.posts.push(
+    circle(95, 720, 8, { role:'post', color:T.colors.wall }),
+    circle(440, 690, 8, { role:'post', color:T.colors.wall }),
+  );
+  T.staticColliders.push(
+    seg(158, 800, 176, 812, { r:3, role:'wall', color:T.colors.wall }),
+    seg(388, 798, 364, 812, { r:3, role:'wall', color:T.colors.wall }),
+  );
+
+  /* ---- SOAP BUMPER (inside the shower stall — slippery) -------------- */
+  T.bumpers.push(
+    { id:'soap', x:130, y:170, r:20, cooldown:0, flash:0, value:250, role:'soap' },
+  );
+
+  /* ---- SINK FAUCETS (HOT + COLD, side-by-side in main playfield) ----- */
+  T.bumpers.push(
+    { id:'hot',  x:370, y:380, r:22, cooldown:0, flash:0, value:340, role:'hot'  },
+    { id:'cold', x:420, y:430, r:22, cooldown:0, flash:0, value:340, role:'cold' },
+  );
+
+  /* ---- MOLD MONSTER — multi-hit boss target (growing on right wall) -- */
+  T.targets.push({
+    letter: 'M', group: 'moldmon', x: 455, y: 600, w: 14, h: 50,
+    vertical: true, hit: false, flash: 0, value: 1600,
+    multiHit: true, hp: 3, maxHp: 3, downTimer: 0,
+    isMoldMonster: true,
   });
 
-  /* ---- SINK FAUCETS (2 bumpers — HOT/COLD) ---- */
-  T.bumpers.push(
-    { x: 200, y: 430, r: 28, cooldown:0, flash:0, value: 350, role:'hot',  label:'H' },
-    { x: 340, y: 430, r: 28, cooldown:0, flash:0, value: 350, role:'cold', label:'C' },
-  );
-  // Sink basin (decorative collider — also acts as a small wall arc)
-  T.staticColliders.push(
-    seg(160, 480, 380, 480, { r:4, role:'wall', color:T.colors.wall }),
-  );
-
-  /* ---- BUGS bank (4 horizontal targets — first wave) ---- */
+  /* ---- BUGS bank (4 VERTICAL drops on right wall, upper) ------------- */
   const bugsBank = makeTargetBank({
-    word: 'BUGS', x: 130, y: 620, dx: 60, dy: 0, w: 38, h: 28,
-    vertical: false, group: 'bugs', value: 600,
+    word: 'BUGS', x: 430, y: 160, dx: 0, dy: 38, w: 28, h: 30,
+    vertical: true, group: 'bugs', value: 600,
   });
   T.targets.push(...bugsBank);
 
-  /* ---- MOLD bank (4 vertical targets, left side — second wave) ---- */
+  /* ---- MOLD bank (4 VERTICAL drops on left wall, mid) ---------------- */
   const moldBank = makeTargetBank({
-    word: 'MOLD', x: 78, y: 260, dx: 0, dy: 36, w: 30, h: 30,
+    word: 'MOLD', x: 80, y: 380, dx: 0, dy: 38, w: 28, h: 30,
     vertical: true, group: 'mold', value: 800,
   });
   T.targets.push(...moldBank);
 
-  /* ---- TOILET LOCK ZONE (top center — multiball drain beast) ---- */
-  T.lockZone = { x: 270, y: 140, r: 22, active: true, label: 'TOILET' };
+  /* ---- TOILET LOCK ZONE (bottom-right of playfield) ------------------ */
+  T.lockZone = { x: 410, y: 680, r: 20, active: true, label: 'TOILET' };
 
-  /* ---- SHOWER STALL (decorative + the shower-toggle mechanic) --------- */
-  T.shower = {
-    on: false,             // toggled by rollover lanes
-    spray: 0,              // animation phase
-    headX: 132, headY: 90, // showerhead position
-    curtainY: 220,         // where the water curtain hits
+  /* ---- WET rollover lanes (3 at top of dining) — toggle shower ------- */
+  T.lanes.push(
+    { x: 260, y: 70, lit: false, label: 'W' },
+    { x: 310, y: 60, lit: false, label: 'E' },
+    { x: 360, y: 70, lit: false, label: 'T' },
+  );
+
+  /* ---- TP ROLL (signature toy — visual decor that "unspools") -------- */
+  T.tpRoll = {
+    x: 300, y: 240, r: 16,
+    unspooled: 0,    // 0..100 (% of paper unspooled)
+    flash: 0,
   };
-  // when ON, this collider becomes active and deflects balls leftward into MOLD bank
-  T.showerCurtain = seg(120, 100, 200, 240,
-    { r:3, role:'wall', color:T.colors.neon, active: false });
-  T.staticColliders.push(T.showerCurtain);
+  T.decor.push({ kind:'tproll', ref: T.tpRoll });
 
-  /* ---- RAMPS (real Z-axis) -------------------------------------------- */
-  // DRAIN RAMP — climbs from left sling around to the shower, ejects from showerhead
+  /* ---- BATHTUB decor (drawn along the upper-mid wall) ---------------- */
+  T.decor.push({ kind:'bathtub', x: 240, y: 110, w: 180, h: 28 });
+
+  /* ---- DRAIN BEAST visual (decorative drain under flippers) ---------- */
+  T.drainBeast = {
+    x: 270, y: 922, w: 200, h: 28,
+    saveChance: 0.25,        // flush-save chance
+    swirl: 0,
+    saveFlash: 0,
+    glow: 0,
+  };
+  T.decor.push({ kind:'drainbeast', ref: T.drainBeast });
+
+  /* ---- DRAIN RAMP (only ramp — from right sling up into shower stall) */
   T.ramps.push(makeRamp({
     id: 'drain_ramp',
     path: [
-      { x: 110, y: 640 }, { x: 86, y: 500 }, { x: 110, y: 360 },
-      { x: 180, y: 260 }, { x: 270, y: 200 }, { x: 360, y: 220 },
-      { x: 420, y: 320 }, { x: 430, y: 480 }, { x: 420, y: 640 },
+      { x: 420, y: 640 },
+      { x: 440, y: 540 },
+      { x: 430, y: 420 },
+      { x: 380, y: 320 },
+      { x: 290, y: 240 },
+      { x: 180, y: 180 },
+      { x: 110, y: 130 },
     ],
-    width: 30, h0: 0, h1: 64, exitBoost: 7, mountSpeed: 7,
+    width: 30, h0: 0, h1: 64, exitBoost: 6.5, mountSpeed: 7,
     color: T.colors.neon,
   }));
-  // LOOFAH RAMP — short center scrubber loop
-  T.ramps.push(makeRamp({
-    id: 'loofah_ramp',
-    path: [
-      { x: 270, y: 520 }, { x: 270, y: 430 }, { x: 240, y: 380 },
-      { x: 270, y: 320 }, { x: 310, y: 310 },
-    ],
-    width: 28, h0: 0, h1: 44, exitBoost: 6, mountSpeed: 6.5,
-    color: T.colors.neon2,
-  }));
-
-  /* ---- MID-TABLE MINI FLIPPERS (under sink) --------------------------- */
-  T.flippers.push(
-    makeFlipper({ side:'L', group:'mid', px:150, py:540, len:54, r:8,
-      rest: 0.45, active: 0.45 - 0.85, speed: 0.7 }),
-    makeFlipper({ side:'R', group:'mid', px:390, py:540, len:54, r:8,
-      rest: Math.PI - 0.45, active: Math.PI - 0.45 + 0.85, speed: 0.7 }),
-  );
-
-  /* ---- ROLLOVER LANES (top) — SHOWER toggle lanes --------------------- */
-  // Hitting all three lights the shower; subsequent completion toggles it.
-  T.lanes.push(
-    { x: 175, y: 86, lit: false, label: 'S' },
-    { x: 270, y: 78, lit: false, label: 'O' },
-    { x: 365, y: 86, lit: false, label: 'N' },  // S-O-N = SHOWER ON
-  );
-
-  /* ---- TIMED HOLES — DRAIN PIPES on either side ----------------------- */
-  T.teleHoles = [
-    { id: 0, x: 60,  y: 380, r: 14, label: 'L', open: false, timer: 0,
-      capturedBall: null, captureTimer: 0, holdFrames: 40, iris: 0 },
-    { id: 1, x: 480, y: 380, r: 14, label: 'R', open: false, timer: 0,
-      capturedBall: null, captureTimer: 0, holdFrames: 40, iris: 0 },
-  ];
 
   // game state
-  T.wave = 1;              // 1=BUGS, 2=MOLD, 3=DRAIN BEAST
+  T.wave = 1;
   T.bugsKilled = 0;
   T.moldKilled = 0;
   T.beastHits = 0;
+  T.tpCollected = 0;
 
-  /* ---- TABLE-SYSTEMS DATA -------------------------------------------- */
+  /* ---- TABLE-SYSTEMS DATA (engine consumes these) -------------------- */
   T.shotSequence = [
-    { id: 'drain_ramp',  label: 'HIT THE DRAIN',   matchType: 'ramp', matchId: 'drain_ramp' },
-    { id: 'loofah_ramp', label: 'SCRUB THE LOOFAH',matchType: 'ramp', matchId: 'loofah_ramp' },
-    { id: 'lock',        label: 'FLUSH THE TOILET',matchType: 'lock', matchId: null },
-    { id: 'drain_ramp_2',label: 'DRAIN AGAIN',     matchType: 'ramp', matchId: 'drain_ramp' },
+    { id: 'drain_ramp',  label: 'TO THE SHOWER',     matchType:'ramp',   matchId:'drain_ramp' },
+    { id: 'smack_mold',  label: 'SMACK THE MOLD',    matchType:'target', matchId:'moldmon' },
+    { id: 'faucet_combo',label: 'BLAST THE SINK',    matchType:'bumper', matchId:['hot','cold'] },
+    { id: 'lock',        label: 'FLUSH THE TOILET',  matchType:'lock',   matchId:null },
   ];
   T.shotReward = 4500;
   T.shotCompleteBonus = 24000;
@@ -2462,6 +2944,11 @@ function buildShowerDefense(tdef) {
     moldCleared:  'BLEACH VICTORIOUS',
     drainBeast:   'DRAIN BEAST RISES',
     showerOn:     'WATER FORCE LIVE',
+    showerOff:    'TAPS RUN DRY',
+    moldMonHit:   'MOLD MONSTER MAD',
+    moldMonDown:  'MOLD MONSTER DEAD',
+    tpFull:       'TP UNSPOOLED',
+    flushSave:    'FLUSH SAVE',
     multiball:    'EVERY DRAIN ALIVE',
     extraBall:    'BAR OF SOAP BONUS',
     victory:      'SPOTLESS CHAMPION',
@@ -2469,11 +2956,13 @@ function buildShowerDefense(tdef) {
 
   T.extraBallScoreThresholds = [40000, 120000];
 
+  /* ---- BANK COMPLETION (wave progression) --------------------------- */
   T.onBankComplete = function(group, T) {
     if (group === 'bugs') {
       T.bugsKilled++;
       addScore(3500 * _pb.mult);
       dmdPlay(animBugWave());
+      addTP(T, 18);
       if (T.wave === 1) {
         storyBeat('bugsCleared', T);
         T.wave = 2;
@@ -2483,6 +2972,7 @@ function buildShowerDefense(tdef) {
       T.moldKilled++;
       addScore(4500 * _pb.mult);
       dmdPlay(animMoldSplat());
+      addTP(T, 22);
       if (T.wave === 2) {
         storyBeat('moldCleared', T);
         T.wave = 3;
@@ -2492,21 +2982,68 @@ function buildShowerDefense(tdef) {
     }
   };
 
-  // Shower-toggle hook called from the lane-rollover code below
+  /* ---- MULTI-HIT TARGET (MOLD MONSTER) HANDLERS --------------------- */
+  T.onMultiHit = function(t, T) {
+    addTP(T, 8);
+    dmdFlash('MOLD MONSTER', 'HP ' + t.hp + '/' + t.maxHp);
+    storyBeatRepeatable('moldMonHit', T);
+  };
+  T.onMultiHitDown = function(t, T) {
+    addTP(T, 25);
+    storyBeat('moldMonDown', T);
+    dmdPlay(animMoldMonsterDown());
+    snd('moldSplat');
+  };
+  T.onMultiHitReturn = function(t, T) {
+    dmdFlash('MOLD RETURNS');
+  };
+
+  /* ---- LANES COMPLETE — toggles the shower -------------------------- */
   T.onLanesComplete = function(T) {
     T.shower.on = !T.shower.on;
     T.showerCurtain.active = T.shower.on;
     if (T.shower.on) {
+      T.shower.duration = 360;  // 6 seconds of shower
       storyBeatRepeatable('showerOn', T);
       dmdPlay(animShowerOn());
+      snd('showerOn');
     } else {
+      storyBeatRepeatable('showerOff', T);
       dmdFlash('SHOWER OFF');
+      snd('drip');
     }
-    snd('shower');
+  };
+
+  /* ---- BALL-SAVER hook (flush save) --------------------------------- */
+  T.onBallDrained = function(T) {
+    if (Math.random() < T.drainBeast.saveChance) {
+      T.drainBeast.saveFlash = 60;
+      dmdPlay(animFlushSave());
+      storyBeatRepeatable('flushSave', T);
+      snd('flush');
+      return true;
+    }
+    return false;
   };
 
   return T;
 }
+
+/* helper: add to the TP roll and trigger jackpot when fully unspooled */
+function addTP(T, amount) {
+  if (!T.tpRoll) return;
+  T.tpRoll.unspooled = Math.min(100, T.tpRoll.unspooled + amount);
+  T.tpRoll.flash = 24;
+  T.tpCollected = (T.tpCollected || 0) + amount;
+  if (T.tpRoll.unspooled >= 100) {
+    addScore(25000 * _pb.mult);
+    dmdPlay(animTPJackpot());
+    storyBeatRepeatable('tpFull', T);
+    snd('cashRegister');
+    T.tpRoll.unspooled = 0;
+  }
+}
+
 
 /* ==========================================================================
  * SECTION 11 — COLLIDER ASSEMBLY
@@ -3714,6 +4251,16 @@ function tick(now) {
       }
     }
     for (const wh of _table.wormholes) { wh.swirl += 0.08; }
+    // shower auto-timeout (Shower Defense)
+    if (_table.shower && _table.shower.on && _table.shower.duration > 0) {
+      _table.shower.duration--;
+      if (_table.shower.duration === 0) {
+        _table.shower.on = false;
+        if (_table.showerCurtain) _table.showerCurtain.active = false;
+        dmdFlash('SHOWER OFF');
+        snd('drip');
+      }
+    }
     // timed teleport holes open/close + capture
     if (_table.teleHoles) stepTeleHoles(_table);
     stepMode(_table);
@@ -3819,6 +4366,41 @@ function drawPlayfield() {
     }
     for (let gy = 60; gy <= 280; gy += 34) {
       ctx.beginPath(); ctx.moveTo(310, gy); ctx.lineTo(514, gy); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // ---- shower-stall floor tint (Shower Defense) — distinct tiled room ----
+  if (T.id === 'shower_defense') {
+    ctx.save();
+    ctx.fillStyle = 'rgba(46,232,232,0.07)';
+    ctx.fillRect(26, 26, 194, 254);   // shower stall interior
+    // tile grid
+    ctx.strokeStyle = 'rgba(46,232,232,0.12)';
+    ctx.lineWidth = 1;
+    for (let gx = 26; gx <= 220; gx += 32) {
+      ctx.beginPath(); ctx.moveTo(gx, 26); ctx.lineTo(gx, 280); ctx.stroke();
+    }
+    for (let gy = 60; gy <= 280; gy += 32) {
+      ctx.beginPath(); ctx.moveTo(26, gy); ctx.lineTo(220, gy); ctx.stroke();
+    }
+    // showerhead in the corner
+    ctx.fillStyle = '#9eb5c0';
+    ctx.fillRect(54, 76, 24, 6);
+    ctx.fillRect(60, 60, 4, 16);
+    // active spray when shower is on
+    if (T.shower && T.shower.on) {
+      ctx.strokeStyle = 'rgba(150,210,255,0.6)';
+      ctx.lineWidth = 2;
+      for (let i = 0; i < 8; i++) {
+        const sx = 56 + i * 3;
+        const phase = ((_pb.tick * 2) + i * 7) % 40;
+        const y1 = 82 + phase;
+        const y2 = y1 + 14;
+        ctx.beginPath();
+        ctx.moveTo(sx, y1);
+        ctx.lineTo(sx, y2);
+        ctx.stroke();
+      }
     }
     ctx.restore();
   }
@@ -4102,6 +4684,9 @@ function drawDecor(ctx, T) {
   for (const d of T.decor) {
     if (d.kind === 'tipjar' && d.ref) drawTipJar(ctx, d.ref, T);
     else if (d.kind === 'dishwasher' && d.ref) drawDishwasher(ctx, d.ref, T);
+    else if (d.kind === 'tproll' && d.ref) drawTPRoll(ctx, d.ref, T);
+    else if (d.kind === 'bathtub') drawBathtub(ctx, d, T);
+    else if (d.kind === 'drainbeast' && d.ref) drawDrainBeast(ctx, d.ref, T);
     else if (d.kind === 'sign') {
       ctx.save();
       const blink = ((_pb.tick >> 4) & 1) ? 1 : 0.55;
@@ -4116,6 +4701,145 @@ function drawDecor(ctx, T) {
       ctx.restore();
     }
   }
+}
+
+/* TP ROLL — drawn as cardboard cylinder with paper unspooling downward */
+function drawTPRoll(ctx, roll, T) {
+  ctx.save();
+  const x = roll.x, y = roll.y, r = roll.r;
+  // cylinder body
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, TAU);
+  const g = ctx.createRadialGradient(x - r*0.3, y - r*0.3, r*0.2, x, y, r);
+  g.addColorStop(0, '#ffffff');
+  g.addColorStop(0.8, '#f6f0e0');
+  g.addColorStop(1, '#cbb98a');
+  ctx.fillStyle = g;
+  ctx.shadowColor = '#fff'; ctx.shadowBlur = 6;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  // center hole
+  ctx.beginPath();
+  ctx.arc(x, y, r * 0.32, 0, TAU);
+  ctx.fillStyle = '#3a2a18';
+  ctx.fill();
+  // unspooled paper trail
+  const trailLen = (roll.unspooled / 100) * 120;
+  if (trailLen > 0) {
+    ctx.fillStyle = '#f6f0e0';
+    ctx.strokeStyle = '#cbb98a'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x - r * 0.8, y + r);
+    ctx.lineTo(x + r * 0.8, y + r);
+    ctx.lineTo(x + r * 0.8, y + r + trailLen);
+    ctx.lineTo(x - r * 0.8, y + r + trailLen);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    // perforation ticks
+    for (let i = 0; i < trailLen / 18; i++) {
+      const py = y + r + 8 + i * 18;
+      ctx.beginPath();
+      ctx.moveTo(x - r * 0.7, py);
+      ctx.lineTo(x + r * 0.7, py);
+      ctx.strokeStyle = '#cbb98a';
+      ctx.setLineDash([2, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  // label
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('TP', x, y - r - 4);
+  // flash overlay
+  if (roll.flash > 0) {
+    roll.flash--;
+    ctx.globalAlpha = roll.flash / 24;
+    ctx.beginPath();
+    ctx.arc(x, y, r * 1.2, 0, TAU);
+    ctx.fillStyle = T.colors.neon || '#2ee8e8';
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+/* Bathtub — decorative outline drawn across the upper-mid wall */
+function drawBathtub(ctx, d, T) {
+  ctx.save();
+  const x = d.x, y = d.y, w = d.w, h = d.h;
+  ctx.strokeStyle = T.colors.decor || '#a8e8e8';
+  ctx.lineWidth = 2;
+  ctx.shadowColor = T.colors.decor || '#a8e8e8'; ctx.shadowBlur = 4;
+  // tub outline (rounded rectangle)
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + w, y);
+  ctx.quadraticCurveTo(x + w + 8, y + h/2, x + w, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.quadraticCurveTo(x - 8, y + h/2, x, y);
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  // faucet on the left
+  ctx.fillStyle = '#9eb5c0';
+  ctx.fillRect(x - 6, y + h - 4, 4, 6);
+  ctx.fillRect(x - 10, y + h - 1, 8, 3);
+  // water inside (faint)
+  ctx.fillStyle = 'rgba(120,200,240,0.18)';
+  ctx.fillRect(x + 4, y + 6, w - 8, h - 10);
+  // label
+  ctx.fillStyle = '#a8e8e8'; ctx.globalAlpha = 0.7;
+  ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('TUB', x + w/2, y + h/2 + 4);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+/* DRAIN BEAST — themed drain under the flippers with animated swirling water */
+function drawDrainBeast(ctx, db, T) {
+  ctx.save();
+  const x = db.x, y = db.y, w = db.w, h = db.h;
+  // body
+  ctx.fillStyle = '#0a3848';
+  ctx.fillRect(x - w/2, y - h/2, w, h);
+  ctx.strokeStyle = T.colors.wall || '#3f7f8a';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x - w/2, y - h/2, w, h);
+  // grate (vertical bars)
+  ctx.strokeStyle = '#9eb5c0'; ctx.lineWidth = 1.5;
+  for (let gx = x - w/2 + 10; gx < x + w/2 - 8; gx += 8) {
+    ctx.beginPath();
+    ctx.moveTo(gx, y - h/2 + 4);
+    ctx.lineTo(gx, y + h/2 - 4);
+    ctx.stroke();
+  }
+  // animated swirl in the middle
+  db.swirl = (db.swirl + 0.12) % TAU;
+  ctx.strokeStyle = 'rgba(120,200,240,0.6)'; ctx.lineWidth = 1.5;
+  for (let i = 0; i < 3; i++) {
+    const ang = db.swirl + i * 1.2;
+    ctx.beginPath();
+    ctx.arc(x, y, (h/2 - 6) - i * 2, ang, ang + Math.PI * 0.8);
+    ctx.stroke();
+  }
+  // eye glints (subtle "beast" feel)
+  ctx.fillStyle = '#ff5a4c';
+  ctx.beginPath(); ctx.arc(x - 30, y, 1.5, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 30, y, 1.5, 0, TAU); ctx.fill();
+  // label
+  ctx.fillStyle = '#a8e8e8';
+  ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('DRAIN BEAST', x, y + h/2 + 12);
+  // save flash
+  if (db.saveFlash > 0) {
+    db.saveFlash--;
+    ctx.globalAlpha = db.saveFlash / 60;
+    ctx.fillStyle = T.colors.neon;
+    ctx.fillRect(x - w/2, y - h/2, w, h);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
 }
 
 function drawShowerSpray(ctx, T) {
@@ -4322,6 +5046,50 @@ function drawTarget(ctx, t, T) {
     ctx.restore();
     return;
   }
+  // Mold Monster multi-hit target: blobby green creature with eyes
+  if (t.isMoldMonster) {
+    const down = t.hp === 0;
+    // wobbly blob body (slightly animated by tick)
+    const wig = Math.sin(_pb.tick * 0.12) * 1.5;
+    ctx.fillStyle = down ? '#3a4a3a' : (flash > 0 ? '#dfffd0' : '#6dd44a');
+    if (flash > 0) { ctx.shadowColor = '#dfffd0'; ctx.shadowBlur = 16 * flash; }
+    // Draw blob as overlapping circles
+    for (let dy = -t.h/2; dy <= t.h/2; dy += 6) {
+      const rad = (t.w/2 + 2) - Math.abs(dy / 4);
+      ctx.beginPath();
+      ctx.arc(t.x + (dy === -t.h/2 ? 0 : wig), t.y + dy, Math.max(3, rad), 0, TAU);
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+    // Eyes (only when alive)
+    if (!down) {
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(t.x - 3, t.y - 5, 2, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(t.x + 3, t.y - 5, 2, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(t.x - 3, t.y - 5, 1, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(t.x + 3, t.y - 5, 1, 0, TAU); ctx.fill();
+      // tendrils on top (mold growth)
+      ctx.strokeStyle = '#4a8a2a'; ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(t.x - 4, t.y - t.h/2); ctx.lineTo(t.x - 4, t.y - t.h/2 - 6);
+      ctx.moveTo(t.x, t.y - t.h/2);     ctx.lineTo(t.x, t.y - t.h/2 - 8);
+      ctx.moveTo(t.x + 4, t.y - t.h/2); ctx.lineTo(t.x + 4, t.y - t.h/2 - 6);
+      ctx.stroke();
+    }
+    // HP pips
+    for (let i = 0; i < (t.maxHp || 3); i++) {
+      ctx.beginPath();
+      ctx.arc(t.x - (t.maxHp - 1) * 4 + i * 8, t.y + t.h/2 + 8, 2.5, 0, TAU);
+      ctx.fillStyle = i < t.hp ? '#6dd44a' : '#444';
+      ctx.fill();
+    }
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 8px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('MOLD MON', t.x, t.y + t.h/2 + 22);
+    ctx.restore();
+    return;
+  }
   // standard drop target
   const col = t.hit ? '#3a3a55' : (flash > 0 ? '#fff' : T.colors.neon2);
   ctx.fillStyle = col;
@@ -4444,6 +5212,43 @@ function drawBall(ctx, ball, T) {
     ctx.beginPath();
     ctx.arc(ball.x - r * 0.3, ball.y - r * 0.3, r * 0.22, 0, TAU);
     ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fill();
+    return;
+  }
+  // SHOWER DEFENSE: render ball as a soapy water droplet (cyan with foam)
+  if (T.id === 'shower_defense') {
+    // outer foam ring (slightly larger soft halo)
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, r * 1.15, 0, TAU);
+    ctx.fillStyle = 'rgba(220,240,255,0.45)';
+    ctx.fill();
+    // main droplet body — bright cyan gradient
+    const dg = ctx.createRadialGradient(ball.x - r*0.35, ball.y - r*0.4, r*0.1,
+                                        ball.x, ball.y, r);
+    dg.addColorStop(0, '#ffffff');
+    dg.addColorStop(0.4, '#cdf4ff');
+    dg.addColorStop(0.85, '#46c8e8');
+    dg.addColorStop(1, '#2682a0');
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, r, 0, TAU);
+    ctx.fillStyle = dg;
+    ctx.fill();
+    // foam bubbles dotted around (random per frame for shimmer)
+    const seed = (ball.x + ball.y) | 0;
+    for (let i = 0; i < 4; i++) {
+      const ang = (seed + i * 47) * 0.31 + (_pb.tick * 0.05);
+      const rr = r * 0.7;
+      const bx = ball.x + Math.cos(ang) * rr;
+      const by = ball.y + Math.sin(ang) * rr;
+      ctx.beginPath();
+      ctx.arc(bx, by, r * 0.18, 0, TAU);
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.fill();
+    }
+    // bright specular
+    ctx.beginPath();
+    ctx.arc(ball.x - r * 0.3, ball.y - r * 0.4, r * 0.28, 0, TAU);
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
     ctx.fill();
     return;
   }
